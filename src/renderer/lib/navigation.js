@@ -29,6 +29,8 @@ import {
   isSupportedEnsTransport,
   formatOnchainAppUrl,
   formatOnchainAppDisplayUrl,
+  getOnchainNameKey,
+  parseOnchainAppUrl,
   looksLikeOnchainAppInput,
 } from './url-utils.js';
 import { buildSearchUrl } from './search-utils.js';
@@ -410,7 +412,7 @@ const gatewayUrlToBzzUrl = (gatewayUrl) => {
 // `scheme:…` with no whitespace (so a query like "rad: what is it" still
 // searches).
 const EXPLICIT_DWEB_ADDRESS_RE =
-  /^(?:(?:bzz|ipfs|ipns|ens|web3|freedom):\/\/|(?:bzz|ipfs|ipns|ens|web3|freedom|rad|ethereum):\S*$)/i;
+  /^(?:(?:bzz|ipfs|ipns|ens|web3|w3|freedom):\/\/|(?:bzz|ipfs|ipns|ens|web3|w3|freedom|rad|ethereum):\S*$)/i;
 
 // Build a file:// URL for error.html. `targetUrl` is the user-facing URL
 // shown in the address bar and on the page. `extras` can include:
@@ -735,6 +737,8 @@ const toggleTrustPopover = () => {
     value: addressInput?.value || '',
     ensTrustByName: state.ensTrustByName,
     onchainProvenance: getActiveTab()?.onchainProvenance,
+    onchainNames: getActiveTab()?.navigationState?.onchainNames,
+    committedUrl: getActiveTab()?.url,
   });
   if (!badge) return;
 
@@ -946,6 +950,8 @@ const updateProtocolIcon = () => {
       value: addressInput?.value || '',
       ensTrustByName: state.ensTrustByName,
       onchainProvenance: getActiveTab()?.onchainProvenance,
+      onchainNames: getActiveTab()?.navigationState?.onchainNames,
+      committedUrl: getActiveTab()?.url,
     });
     if (badge) {
       trustShield.setAttribute('data-trust', badge.level);
@@ -1056,6 +1062,7 @@ export const setAgentWorkspaceNavigationEditable = (editable) => {
         ipnsRoutePrefix: state.ipnsRoutePrefix,
         radicleApiPrefix: state.radicleApiPrefix,
         knownEnsNames: state.knownEnsNames,
+        onchainNames: tab.navigationState?.onchainNames,
       });
     }
     addressInput.blur();
@@ -1428,7 +1435,7 @@ const parseInternalPageTarget = (value) => {
 // itself (main would answer `not-external` for them anyway).
 const EXTERNAL_PROTOCOL_INPUT = /^[a-z][a-z0-9+.-]*:\S+$/i;
 const BROWSER_HANDLED_INPUT =
-  /^(?:https?|bzz|ipfs|ipns|web3|ens|rad|freedom|ethereum|file|about|data|blob|javascript|view-source|chrome|devtools):/i;
+  /^(?:https?|bzz|ipfs|ipns|web3|w3|ens|rad|freedom|ethereum|file|about|data|blob|javascript|view-source|chrome|devtools):/i;
 
 export const loadTarget = (value, displayOverride = null, targetWebview = null, options = {}) => {
   if (!targetWebview && !options.pageInitiated && !options.continuesNavigation &&
@@ -1629,6 +1636,7 @@ export const loadTarget = (value, displayOverride = null, targetWebview = null, 
   // else and stand down instead of cancelling it (#86).
   if (navState) {
     navState.requestedNavigationSequence = (navState.requestedNavigationSequence || 0) + 1;
+    navState.pendingOnchainName = null;
   }
 
   // Every chrome-initiated navigation funnels through here (address-bar
@@ -1732,6 +1740,7 @@ export const loadTarget = (value, displayOverride = null, targetWebview = null, 
             ipnsRoutePrefix: state.ipnsRoutePrefix,
             radicleApiPrefix: state.radicleApiPrefix,
             knownEnsNames: state.knownEnsNames,
+            onchainNames: navState.onchainNames,
           });
 
           if (loadUrl === `view-source:${targetUri}`) {
@@ -1759,6 +1768,7 @@ export const loadTarget = (value, displayOverride = null, targetWebview = null, 
       ipnsRoutePrefix: state.ipnsRoutePrefix,
       radicleApiPrefix: state.radicleApiPrefix,
       knownEnsNames: state.knownEnsNames,
+      onchainNames: navState.onchainNames,
     });
     setAddressDisplayForTab(viewSourceNavigation.addressValue, targetTabId, {
       isViewingSourceForTab: true,
@@ -1817,7 +1827,14 @@ export const loadTarget = (value, displayOverride = null, targetWebview = null, 
   // chain-data router. No gateway URL or page-owned RPC endpoint is involved.
   const onchainAppUrl = formatOnchainAppUrl(value);
   if (onchainAppUrl) {
-    const displayValue = displayOverride || formatOnchainAppDisplayUrl(value) || onchainAppUrl;
+    const parsed = parseOnchainAppUrl(value);
+    navState.pendingOnchainName = parsed.name ? parsed.url.split('#')[0] : null;
+    // A deliberately entered address should display as an address. Links
+    // within a named site keep its mapping, as do resolution continuations.
+    if (!parsed.name && !options.pageInitiated && !options.continuesNavigation) {
+      navState.onchainNames?.delete(getOnchainNameKey(value));
+    }
+    const displayValue = displayOverride || formatOnchainAppDisplayUrl(value, navState.onchainNames) || onchainAppUrl;
     setAddressDisplayForTab(displayValue, targetTabId);
     navState.pendingTitleForUrl = onchainAppUrl;
     navState.pendingNavigationUrl = onchainAppUrl;
@@ -1830,7 +1847,7 @@ export const loadTarget = (value, displayOverride = null, targetWebview = null, 
   if (looksLikeOnchainAppInput(value)) {
     pushDebug(`[Onchain App] Invalid web3 URL: ${value}`);
     alert(
-      'Invalid onchain application URL. Expected web3://<contract>:<chainId>/ ' +
+      'Invalid onchain application URL. Expected web3://<contract-or-name>:<chainId>/ ' +
         '(Ethereum mainnet is used when the chain is omitted).'
     );
     return;
@@ -1952,6 +1969,39 @@ export const loadTarget = (value, displayOverride = null, targetWebview = null, 
             continuesNavigation: true,
             // A page-driven first leg stays page-driven: the Swarm retry
             // streak (startBzzNavigationWithProbe) keys on it.
+            pageInitiated: !!options.pageInitiated,
+          });
+          return;
+        }
+
+        if (result.protocol === 'web3') {
+          if (assertedTransport) {
+            failEnsResolution(
+              `${systemLabel} transport mismatch for ${ens.name}: asserted ${assertedTransport}, got web3`,
+              `${systemLabel} name ${ens.name} resolves to web3, not ${assertedTransport}.`
+            );
+            return;
+          }
+          const targetUri = applyEnsSuffix(result.uri, ens.suffix);
+          if (!formatOnchainAppUrl(targetUri)) {
+            failEnsResolution(`Invalid contentcontract URL for ${ens.name}`, 'Invalid contract website URL.');
+            return;
+          }
+          if (
+            result.trust?.level === 'unverified' &&
+            state.blockUnverifiedEns &&
+            !options.allowUnverifiedOnce
+          ) {
+            capturedWebview.loadURL(buildNameUnverifiedPageUrl(ens.name, targetUri));
+            return;
+          }
+          const { knownEnsPairs } = extractEnsResolutionMetadata(targetUri, ens.name);
+          navState.onchainNames ||= new Map();
+          for (const [key, name] of knownEnsPairs) navState.onchainNames.set(key, name);
+          const displayUrl = formatOnchainAppDisplayUrl(targetUri, navState.onchainNames);
+          loadTarget(targetUri, displayOverride || displayUrl, capturedWebview, {
+            nameResolutionDepth: resolutionDepth + 1,
+            continuesNavigation: true,
             pageInitiated: !!options.pageInitiated,
           });
           return;
@@ -2556,7 +2606,13 @@ const refreshNameTrustAfterTraversal = (tabId, previousUrl = '') => {
   const repaintBadge = () => {
     // Background tabs repaint from the refreshed map when they are switched
     // back to; only the foreground shield needs redrawing now.
-    if (isActiveTab(tabId)) updateProtocolIcon();
+    if (isActiveTab(tabId)) {
+      const tab = getTabById(tabId);
+      if (tab?.navigationState?.committedDisplayUrl) {
+        commitAddressDisplay(tab.navigationState.committedDisplayUrl, tab.navigationState);
+      }
+      updateProtocolIcon();
+    }
   };
   // Anchored interstitial check (#243), never a substring test: a remote page
   // is free to serve a path that reads like `pages/ens-conflict.html`, and
@@ -2763,6 +2819,10 @@ const retryErrorPageOrReload = (webview, hard) => {
   const navState = getNavState();
   const committedDisplay = (navState.committedDisplayUrl || '').trim();
   const ensInput = committedDisplay ? parseEnsInput(committedDisplay) : null;
+  if (parseOnchainAppUrl(committedDisplay)?.name) {
+    loadTarget(committedDisplay, null, null, { keepsAddressBarEdit: true });
+    return;
+  }
   if (ensInput) {
     if (hard) invalidateContentName(ensInput);
     pushDebug(
@@ -2854,6 +2914,7 @@ const handleNavigationEvent = (event) => {
         ipnsRoutePrefix: state.ipnsRoutePrefix,
         radicleApiPrefix: state.radicleApiPrefix,
         knownEnsNames: state.knownEnsNames,
+        onchainNames: navState.onchainNames,
       });
       // Fail safe if a view-source commit on the onchain trust gate lands
       // anyway (session restore, a back/forward entry predating the refusal
@@ -2881,7 +2942,7 @@ const handleNavigationEvent = (event) => {
     // of exposing the implementation's file:// URL.
     const onchainInterstitialTarget = getOnchainInterstitialTarget(event.url);
     if (onchainInterstitialTarget) {
-      const displayUrl = formatOnchainAppDisplayUrl(onchainInterstitialTarget);
+      const displayUrl = formatOnchainAppDisplayUrl(onchainInterstitialTarget, navState.onchainNames);
       if (displayUrl) commitAddressDisplay(displayUrl, navState);
       navState.pendingTitleForUrl = event.url;
       navState.pendingNavigationUrl = event.url;
@@ -2977,6 +3038,7 @@ const handleNavigationEvent = (event) => {
         ipnsRoutePrefix: state.ipnsRoutePrefix,
         radicleApiPrefix: state.radicleApiPrefix,
         knownEnsNames: state.knownEnsNames,
+        onchainNames: navState.onchainNames,
       });
 
       // Don't clear address bar if navigating to about:blank and it has a value
@@ -3107,7 +3169,13 @@ export const initNavigation = () => {
   setAgentWorkspaceNavigationEditable(agentWorkspaceNavigationEditable);
 
   setOnchainProvenanceChangeHandler((tabId) => {
-    if (isActiveTab(tabId)) updateProtocolIcon();
+    if (isActiveTab(tabId)) {
+      const tab = getTabById(tabId);
+      if (tab?.navigationState?.committedDisplayUrl) {
+        commitAddressDisplay(tab.navigationState.committedDisplayUrl, tab.navigationState);
+      }
+      updateProtocolIcon();
+    }
   });
 
   if (trustShield) {
@@ -3554,7 +3622,7 @@ export const initNavigation = () => {
           const target = formatOnchainAppUrl(payload.target);
           const token = typeof payload.token === 'string' ? payload.token : '';
           if (target && /^[A-Za-z0-9_-]{43}$/.test(token)) {
-            const displayUrl = formatOnchainAppDisplayUrl(target);
+            const displayUrl = formatOnchainAppDisplayUrl(target, getTabById(data.tabId)?.navigationState?.onchainNames);
             if (displayUrl) setAddressDisplayForTab(displayUrl, data.tabId);
             webview.loadURL(target, {
               extraHeaders: `X-Freedom-Onchain-App-Approval: ${token}`,
@@ -3696,6 +3764,7 @@ export const initNavigation = () => {
             ipnsRoutePrefix: state.ipnsRoutePrefix,
             radicleApiPrefix: state.radicleApiPrefix,
             knownEnsNames: state.knownEnsNames,
+            onchainNames: tabNavState.onchainNames,
           });
           // Don't clear address bar if it has a value and we're on about:blank
           // (happens during "open in new window" before loadTarget runs)

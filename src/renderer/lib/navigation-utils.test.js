@@ -806,3 +806,33 @@ describe('navigation-utils', () => {
     });
   });
 });
+
+describe('named web3 display and provenance', () => {
+  test('uses existing ENS metadata and display helpers for web3', async () => {
+    const { extractEnsResolutionMetadata, deriveDisplayAddress, deriveSwitchedTabDisplay } = await loadNavigationUtils();
+    const address = '0x0000000d42137547140b0812e1178f025e08bc49';
+    const url = `web3://${address}.eip155-8453/html?returns=(string)#home`;
+    const metadata = extractEnsResolutionMetadata(url, 'anon.wei');
+    expect(metadata.resolvedProtocol).toBe('web3');
+    const options = { url, onchainNames: new Map(metadata.knownEnsPairs) };
+    expect(deriveDisplayAddress(options)).toBe('web3://anon.wei/html?returns=(string)#home');
+    expect(deriveSwitchedTabDisplay(options)).toBe('web3://anon.wei/html?returns=(string)#home');
+  });
+
+  test('a named badge requires both the committed mapping and matching contract provenance', async () => {
+    const { extractEnsResolutionMetadata, resolveTrustBadge } = await loadNavigationUtils();
+    const contract = '0x0000000d42137547140b0812e1178f025e08bc49';
+    const committedUrl = `web3://${contract}.eip155-1/`;
+    const onchainNames = new Map(extractEnsResolutionMetadata(committedUrl, 'anon.wei').knownEnsPairs);
+    const options = {
+      value: 'web3://anon.wei/', committedUrl, onchainNames,
+      onchainProvenance: { chainId: 1, contract, trust: { level: 'verified', method: 'myotis' } },
+    };
+    expect(resolveTrustBadge(options)).toMatchObject({ kind: 'onchain', name: 'web3://anon.wei', level: 'verified' });
+    expect(resolveTrustBadge({ ...options, value: 'web3://anon.wei/Swap?route=Home' }))
+      .toMatchObject({ kind: 'onchain', level: 'verified' });
+    expect(resolveTrustBadge({ ...options, value: 'web3://other.wei/' })).toBeNull();
+    expect(resolveTrustBadge({ ...options, committedUrl: `web3://${contract}.eip155-100/` })).toBeNull();
+    expect(resolveTrustBadge({ ...options, onchainNames: new Map() })).toBeNull();
+  });
+});

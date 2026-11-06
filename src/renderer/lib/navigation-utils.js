@@ -2,6 +2,7 @@ import {
   applyEnsNamePreservation,
   deriveDisplayValue,
   formatOnchainAppDisplayUrl,
+  getOnchainNamePair,
   parseOnchainAppUrl,
 } from './url-utils.js';
 import {
@@ -36,9 +37,16 @@ export const resolveTrustBadge = ({
   value = '',
   ensTrustByName = new Map(),
   onchainProvenance = null,
+  onchainNames = null,
+  committedUrl = '',
 } = {}) => {
   const normalizedValue = value.toLowerCase();
-  const identity = onchainIdentity(normalizedValue);
+  const named = parseOnchainAppUrl(value);
+  const committedName = parseOnchainAppUrl(formatOnchainAppDisplayUrl(committedUrl, onchainNames));
+  const matchesCommittedName = named?.name &&
+    named.name === committedName?.name && named.chainId === committedName.chainId &&
+    named.from === committedName.from;
+  const identity = onchainIdentity(matchesCommittedName ? committedUrl : normalizedValue);
   if (
     identity &&
     onchainProvenance?.trust?.level &&
@@ -49,7 +57,7 @@ export const resolveTrustBadge = ({
     return {
       kind: 'onchain',
       level: onchainProvenance.trust.level,
-      name: `web3://${shortContract}`,
+      name: matchesCommittedName ? `web3://${named.name}` : `web3://${shortContract}`,
       trust: onchainProvenance.trust,
       provenance: onchainProvenance,
     };
@@ -460,6 +468,12 @@ export const extractEnsResolutionMetadata = (targetUri, ensName) => {
   const knownEnsPairs = [];
   let resolvedProtocol = null;
 
+  const onchainPair = getOnchainNamePair(targetUri, ensName);
+  if (onchainPair) {
+    knownEnsPairs.push(onchainPair);
+    resolvedProtocol = 'web3';
+  }
+
   const bzzMatch = targetUri.match(/^bzz:\/\/([a-fA-F0-9]+)/);
   if (bzzMatch) {
     knownEnsPairs.push([bzzMatch[1].toLowerCase(), ensName]);
@@ -508,6 +522,7 @@ export const deriveDisplayAddress = ({
   ipnsRoutePrefix = null,
   radicleApiPrefix = null,
   knownEnsNames = new Map(),
+  onchainNames = null,
 } = {}) => {
   if (url.startsWith('freedom-preview://')) return 'Workspace preview';
   // A new-tab page derives to an empty address bar. `deriveDisplayValue`
@@ -527,7 +542,7 @@ export const deriveDisplayAddress = ({
     radicleApiPrefix
   );
 
-  return applyEnsNamePreservation(display, knownEnsNames);
+  return applyEnsNamePreservation(applyEnsNamePreservation(display, onchainNames), knownEnsNames);
 };
 
 // ENS-host transport URLs (`bzz://name.eth/...`, `ipfs://name.eth/...`,
@@ -546,6 +561,7 @@ export const buildViewSourceNavigation = ({
   ipnsRoutePrefix = null,
   radicleApiPrefix = null,
   knownEnsNames = new Map(),
+  onchainNames = null,
 } = {}) => {
   const innerUrl = value.startsWith('view-source:') ? value.slice(12) : value;
 
@@ -587,6 +603,7 @@ export const buildViewSourceNavigation = ({
     ipnsRoutePrefix,
     radicleApiPrefix,
     knownEnsNames,
+    onchainNames,
   });
 
   return {
@@ -607,6 +624,7 @@ export const deriveSwitchedTabDisplay = ({
   ipnsRoutePrefix = null,
   radicleApiPrefix = null,
   knownEnsNames = new Map(),
+  onchainNames = null,
 } = {}) => {
   // An uncommitted address-bar edit is per-tab state in Chrome: a tab you left
   // mid-edit is still mid-edit when you come back, whether or not it happens
@@ -651,7 +669,7 @@ export const deriveSwitchedTabDisplay = ({
   if (isOnchainInterstitialPageUrl(strippedUrl)) {
     if (strippedUrl !== url) return '';
     const target = getOnchainInterstitialTarget(url);
-    return (target && formatOnchainAppDisplayUrl(target)) || '';
+    return (target && formatOnchainAppDisplayUrl(target, onchainNames)) || '';
   }
 
   // A tab parked on `pages/error.html?...&url=<original>` should restore the
@@ -678,6 +696,7 @@ export const deriveSwitchedTabDisplay = ({
     ipnsRoutePrefix,
     radicleApiPrefix,
     knownEnsNames,
+    onchainNames,
   });
 
   if (display === homeUrlNormalized) {

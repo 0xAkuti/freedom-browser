@@ -34,7 +34,7 @@ import {
   showLinkStatus,
   setLinkStatusSide,
 } from './link-status.js';
-import { formatOnchainAppDisplayUrl } from './url-utils.js';
+import { formatOnchainAppDisplayUrl, getOnchainNamePair, parseOnchainAppUrl } from './url-utils.js';
 
 const electronAPI = window.electronAPI;
 
@@ -291,7 +291,7 @@ export const getActiveTab = () => {
 export const getOpenTabs = () => {
   return tabState.tabs.filter((tab) => tab.kind !== 'workspace-viewer').map((tab) => ({
     id: tab.id,
-    url: tab.url,
+    url: formatOnchainAppDisplayUrl(tab.url, tab.navigationState?.onchainNames) || tab.url,
     title: tab.title,
     favicon: tab.favicon || '',
     isLoading: tab.isLoading === true,
@@ -466,6 +466,10 @@ const createNavigationState = () => ({
   // navigation is in flight. The actual navigation URL remains in `tab.url`
   // and `currentPageUrl`.
   committedDisplayUrl: '',
+  // Reuse ENS display mappings, scoped to this tab so two names pointing at
+  // the same contract can stay distinct. These never change the guest origin.
+  onchainNames: new Map(),
+  pendingOnchainName: null,
   committedNavigationSequence: 0,
   // The commit counter's sibling, for the other half of the question an
   // async landing site has to ask. `committedNavigationSequence` answers
@@ -625,6 +629,16 @@ const refreshOnchainProvenance = async (tab, url) => {
     ) {
       return;
     }
+    const navState = current.navigationState;
+    const resolvedName = parseOnchainAppUrl(provenance?.nameUrl);
+    if (resolvedName?.name && resolvedName.url.split('#')[0] === navState.pendingOnchainName) {
+      const pair = getOnchainNamePair(url, provenance.nameUrl);
+      if (pair) {
+        navState.onchainNames.set(...pair);
+        navState.committedDisplayUrl = formatOnchainAppDisplayUrl(url, navState.onchainNames);
+      }
+    }
+    navState.pendingOnchainName = null;
     current.onchainProvenance = provenance || null;
     onOnchainProvenanceChange?.(current.id);
   } catch (err) {
@@ -823,7 +837,7 @@ const createWebview = (tabId, initialUrl) => {
           if (event.url !== 'about:blank') {
             const interstitialTarget = getOnchainInterstitialTarget(webviewUrl);
             tab.navigationState.committedDisplayUrl =
-              formatOnchainAppDisplayUrl(interstitialTarget || webviewUrl) || webviewUrl;
+              formatOnchainAppDisplayUrl(interstitialTarget || webviewUrl, tab.navigationState.onchainNames) || webviewUrl;
             wroteCommittedIdentity = true;
           }
         }
@@ -1846,7 +1860,8 @@ export const closeTab = (tabId) => {
   // and the private start page). The stack itself is per-window renderer
   // state, so a private window's closed tabs die with the window and can
   // never be resurrected from a normal window's Cmd/Ctrl+Shift+T.
-  const tabUrl = tab.url || tab.navigationState?.currentPageUrl;
+  const actualUrl = tab.url || tab.navigationState?.currentPageUrl;
+  const tabUrl = formatOnchainAppDisplayUrl(actualUrl, tab.navigationState?.onchainNames) || actualUrl;
   if (tabUrl && tabUrl !== 'about:blank' && tabUrl !== homeUrl && !isPrivateStartUrl(tabUrl)) {
     closedTabsStack.push({
       id: nextClosedTabId++,

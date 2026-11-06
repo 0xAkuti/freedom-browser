@@ -875,7 +875,7 @@ const findClosestAnchor = (start) => {
 const getRawDwebHref = (anchor) => {
   const rawHref = anchor?.getAttribute?.('href')?.trim();
   if (!rawHref) return null;
-  if (/^(ipfs|ipns|web3):\/\//i.test(rawHref)) return rawHref;
+  if (/^(ipfs|ipns|web3|w3):\/\//i.test(rawHref)) return rawHref;
   return null;
 };
 

@@ -85,6 +85,7 @@ const INTERNAL_SCHEMES = [
   'ipfs',
   'ipns',
   'web3',
+  'w3',
   'ens',
   'rad',
   'radapi',

@@ -244,6 +244,43 @@ describe('Tab Navigation State Isolation', () => {
       );
     });
 
+    test('keeps two names for the same contract isolated between tabs', async () => {
+      const { createTab } = await import('./tabs.js');
+      const { getOnchainNamePair } = await import('./url-utils.js');
+      const url = 'web3://0x0000000d42137547140b0812e1178f025e08bc49.eip155-1/';
+      const first = createTab(url);
+      const second = createTab(url);
+      for (const [tab, name] of [[first, 'anon.wei'], [second, 'other.wei']]) {
+        tab.navigationState.onchainNames.set(...getOnchainNamePair(url, name));
+        tab.webview.getURL.mockReturnValue(url);
+        tab.webview._eventHandlers['did-navigate']({ url });
+        expect(tab.url).toBe(url);
+        expect(tab.navigationState.committedDisplayUrl).toBe(`web3://${name}/`);
+      }
+      expect(first.navigationState.committedDisplayUrl).toBe('web3://anon.wei/');
+    });
+
+    test('accepts redirect metadata only for the pending named navigation', async () => {
+      const { createTab } = await import('./tabs.js');
+      const url = 'web3://0x0000000d42137547140b0812e1178f025e08bc49.eip155-1/';
+      const tab = createTab(url);
+      window.electronAPI.getOnchainAppProvenance = jest.fn(async () => ({
+        nameUrl: 'web3://anon.wei/',
+      }));
+      tab.webview.getWebContentsId = () => 999;
+      tab.webview.getURL.mockReturnValue(url);
+      tab.navigationState.pendingOnchainName = 'web3://other.wei.eip155-1/';
+      tab.webview._eventHandlers['did-navigate']({ url });
+      await Promise.resolve();
+      expect(tab.navigationState.committedDisplayUrl).toContain('0x0000000d');
+      tab.navigationState.pendingOnchainName = 'web3://anon.wei.eip155-1/';
+      tab.webview._eventHandlers['did-navigate']({ url });
+      await Promise.resolve();
+      expect(tab.navigationState.committedDisplayUrl).toBe('web3://anon.wei/');
+      expect(tab.url).toBe(url);
+      window.electronAPI.getOnchainAppProvenance = undefined;
+    });
+
     test('preserves committedDisplayUrl when did-navigate fires for about:blank', async () => {
       // about:blank navigations happen during "open in new window" before
       // the real loadURL runs. Letting them clobber `committedDisplayUrl`

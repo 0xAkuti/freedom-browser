@@ -1,13 +1,12 @@
-import { isDwebNameHost, isEnsHost, isPotentialEnsName } from './origin-utils.js';
+import { isDwebNameHost, isEnsHost, isPotentialEnsName, parseWeb3Url } from './origin-utils.js';
 import { cidV0ToV1Base32, cidV1B58btcToBase32, ipnsMhToCidV1Base36 } from './cid-utils.js';
 
 export const ensureTrailingSlash = (value = '') => (value.endsWith('/') ? value : `${value}/`);
 
 export const DEFAULT_ONCHAIN_APP_CHAIN_ID = 1;
-const ETHEREUM_ADDRESS_RE = /^0x[0-9a-f]{40}$/i;
 
 /**
- * Parse Freedom's ERC-8244 application URL.
+ * Parse a web3 contract or name URL, including the w3 shorthand.
  *
  * Freedom presents the ERC-4804-style `web3://<contract>:<chainId>/` form to
  * users, while Chromium navigates to the equivalent
@@ -18,51 +17,45 @@ const ETHEREUM_ADDRESS_RE = /^0x[0-9a-f]{40}$/i;
  * browser implementation detail from leaking into user-facing URL surfaces.
  */
 export const parseOnchainAppUrl = (input) => {
-  const raw = typeof input === 'string' ? input.trim() : '';
-  if (!raw) return null;
-
-  const canonicalMatch = raw.match(
-    /^web3:\/\/(0x[0-9a-f]{40})\.eip155-([0-9]+)([/?#].*)?$/i
-  );
-  const friendlyMatch = raw.match(/^web3:\/\/(0x[0-9a-f]{40})(?::([0-9]+))?([/?#].*)?$/i);
-  const match = canonicalMatch || friendlyMatch;
-  if (!match || !ETHEREUM_ADDRESS_RE.test(match[1])) return null;
-
-  const chainId = Number(match[2] || DEFAULT_ONCHAIN_APP_CHAIN_ID);
-  if (!Number.isSafeInteger(chainId) || chainId <= 0) return null;
-
-  const address = match[1].toLowerCase();
-  const rawSuffix = match[3] || '/';
-  const suffix = rawSuffix.startsWith('/') ? rawSuffix : `/${rawSuffix}`;
-  const canonicalUrl = `web3://${address}.eip155-${chainId}${suffix}`;
-  const displayChain = chainId === DEFAULT_ONCHAIN_APP_CHAIN_ID ? '' : `:${chainId}`;
-  const displayUrl = `web3://${address}${displayChain}${suffix}`;
-  let parsed;
-  try {
-    parsed = new URL(canonicalUrl);
-  } catch {
-    return null;
-  }
-
+  const parsed = parseWeb3Url(input);
+  if (!parsed) return null;
   return {
-    address,
-    chainId,
-    displayUrl,
-    url: parsed.toString(),
+    address: parsed.address,
+    ...(parsed.name ? { name: parsed.name } : {}),
+    ...(parsed.from ? { from: parsed.from } : {}),
+    chainId: parsed.chainId,
+    displayUrl: parsed.displayUrl,
+    url: parsed.url,
   };
 };
 
-export const looksLikeOnchainAppInput = (input) => /^web3:/i.test((input || '').trim());
+export const looksLikeOnchainAppInput = (input) => /^(?:web3|w3):/i.test((input || '').trim());
 
 export const formatOnchainAppUrl = (input) => parseOnchainAppUrl(input)?.url || null;
 
-export const formatOnchainAppDisplayUrl = (input) => {
+export const formatOnchainAppDisplayUrl = (input, knownNames = null) => {
   const raw = typeof input === 'string' ? input.trim() : '';
   if (raw.startsWith('view-source:')) {
-    const innerDisplay = formatOnchainAppDisplayUrl(raw.slice('view-source:'.length));
+    const innerDisplay = formatOnchainAppDisplayUrl(raw.slice('view-source:'.length), knownNames);
     return innerDisplay ? `view-source:${innerDisplay}` : null;
   }
-  return parseOnchainAppUrl(raw)?.displayUrl || null;
+  const display = parseOnchainAppUrl(raw)?.displayUrl;
+  return display ? applyEnsNamePreservation(display, knownNames) : null;
+};
+
+// Unlike content hashes, a contract address identifies different sites on
+// different chains. Include the optional call sender in the mapping too.
+export const getOnchainNameKey = (input) => {
+  const parsed = parseOnchainAppUrl(input);
+  return parsed?.address
+    ? `web3:${parsed.chainId}:${parsed.address}:${parsed.from || ''}`
+    : null;
+};
+
+export const getOnchainNamePair = (targetUri, name) => {
+  const key = getOnchainNameKey(targetUri);
+  const named = parseOnchainAppUrl(/^(?:web3|w3):/i.test(name) ? name : `web3://${name}`);
+  return key && named?.name ? [key, named.displayUrl.replace(/(web3:\/\/[^/]+).*/, '$1')] : null;
 };
 
 // Set of transports an Ethereum name contenthash can resolve to that the renderer
@@ -411,14 +404,14 @@ export const normalizeLegacyEnsBookmarkUrl = (url) => {
 
 /**
  * Apply name preservation to a display URL.
- * If the URL is a bzz/ipfs/ipns URL with a hash/CID that has a known name,
+ * If the URL is a bzz/ipfs/ipns/web3 URL with a known name,
  * substitute the name as the host, preserving the resolved transport
  * scheme (e.g. `bzz://<hash>/path` → `bzz://<name>/path`). The legacy
  * `ens://<name>` form is intentionally not produced here — see
  * `buildEnsDisplayUri` and the ENS link migration notes.
  *
  * @param {string} displayUrl - Display URL like "bzz://abc123/path" or "ipfs://QmHash/path"
- * @param {Map} knownEnsNames - Map of hash/CID -> name
+ * @param {Map} knownEnsNames - Hash/CID -> name, or contract/chain/sender key -> web3 name origin
  * @returns {string} Display URL with name substituted if applicable
  */
 export const applyEnsNamePreservation = (displayUrl, knownEnsNames) => {
@@ -434,6 +427,12 @@ export const applyEnsNamePreservation = (displayUrl, knownEnsNames) => {
   }
 
   let derived = displayUrl;
+
+  const onchainKey = getOnchainNameKey(derived);
+  const onchainName = onchainKey && knownEnsNames.get(onchainKey);
+  if (onchainName && parseOnchainAppUrl(onchainName)?.name) {
+    return formatOnchainAppDisplayUrl(derived).replace(/^web3:\/\/[^/]+/, onchainName);
+  }
 
   // Apply ENS name preservation for Swarm
   const bzzMatch = derived.match(/^bzz:\/\/([a-fA-F0-9]+)/);

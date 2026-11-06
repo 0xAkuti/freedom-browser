@@ -22,6 +22,7 @@ import {
   deriveRadicleDisplayValue,
   formatOnchainAppUrl,
   formatOnchainAppDisplayUrl,
+  getOnchainNamePair,
   looksLikeOnchainAppInput,
   parseOnchainAppUrl,
 } from './url-utils.js';
@@ -84,6 +85,17 @@ describe('url-utils', () => {
       'https://example.com',
     ])('rejects invalid app URL %s', (url) => {
       expect(formatOnchainAppUrl(url)).toBeNull();
+    });
+
+    test.each(['app.eth', 'app.box', 'app.wei', 'app.gwei', 'sub.app.eth'])('accepts a web3 name %s', (name) => {
+      expect(formatOnchainAppUrl(`web3://${name}:11155111/html`)).toBe(`web3://${name}.eip155-11155111/html`);
+      expect(formatOnchainAppDisplayUrl(`web3://${name}.eip155-11155111/html`)).toBe(`web3://${name}:11155111/html`);
+    });
+
+    test('normalizes the w3 alias and preserves a valid caller address', () => {
+      const caller = '0x2222222222222222222222222222222222222222';
+      expect(formatOnchainAppUrl(`w3://${caller}@app.eth/html`)).toBe(`web3://${caller}@app.eth.eip155-1/html`);
+      expect(looksLikeOnchainAppInput('w3://app.eth')).toBe(true);
     });
 
     test('recognizes malformed web3 input as app intent', () => {
@@ -1512,5 +1524,40 @@ describe('applyDnsNameIdentity', () => {
     expect(applyDnsNameIdentity('https://example.com/', names)).toBe('https://example.com/');
     expect(applyDnsNameIdentity(`ipns://${B58}/`, new Map())).toBe(`ipns://${B58}/`);
     expect(applyDnsNameIdentity('', names)).toBe('');
+  });
+});
+
+describe('web3 ENS name preservation', () => {
+  const address = '0x0000000d42137547140b0812e1178f025e08bc49';
+
+  test('reuses the name mapping while preserving method paths, query, fragment and view-source', () => {
+    const names = new Map([getOnchainNamePair(`web3://${address}:8453/`, 'anon.wei')]);
+    const target = `web3://${address}.eip155-8453/html?returns=(string)#home`;
+    expect(formatOnchainAppDisplayUrl(target, names)).toBe('web3://anon.wei/html?returns=(string)#home');
+    expect(applyEnsNamePreservation(`view-source:${target}`, names))
+      .toBe('view-source:web3://anon.wei/html?returns=(string)#home');
+    // The source name's chain must survive a contentcontract chain override.
+    // Reloading anon.wei:8453 would resolve the name on the wrong chain.
+    expect(formatOnchainAppDisplayUrl(`web3://${address}:1/`, names)).toBe(`web3://${address}/`);
+  });
+
+  test('never applies a mapping to another contract, chain or call sender', () => {
+    const names = new Map([getOnchainNamePair(`web3://${address}/`, 'anon.wei')]);
+    for (const target of [
+      `web3://${address}:100/`,
+      'web3://0x2222222222222222222222222222222222222222/',
+      `web3://0x2222222222222222222222222222222222222222@${address}/`,
+    ]) {
+      expect(formatOnchainAppDisplayUrl(target, names)).toBe(formatOnchainAppDisplayUrl(target));
+    }
+  });
+
+  test('preserves an explicitly selected name-service chain and sender', () => {
+    const sender = '0x2222222222222222222222222222222222222222';
+    const names = new Map([getOnchainNamePair(
+      `web3://${sender}@${address}:8453/`, `web3://${sender}@app.eth:11155111/`
+    )]);
+    expect(formatOnchainAppDisplayUrl(`web3://${sender}@${address}:8453/html`, names))
+      .toBe(`web3://${sender}@app.eth:11155111/html`);
   });
 });

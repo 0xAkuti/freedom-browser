@@ -196,10 +196,9 @@ const loadNavigationModule = async (options = {}) => {
         );
       }
     ),
-    extractEnsResolutionMetadata: jest.fn(() => ({
-      knownEnsPairs: [],
-      resolvedProtocol: null,
-    })),
+    extractEnsResolutionMetadata: jest.fn((uri, name) => uri.startsWith('web3:')
+      ? jest.requireActual('./navigation-utils.js').extractEnsResolutionMetadata(uri, name)
+      : { knownEnsPairs: [], resolvedProtocol: null }),
     getBookmarkBarState: jest.fn(({ url, bookmarkBarOverride }) => {
       const isHomePage = !url || url === homeUrl;
       return {
@@ -270,37 +269,16 @@ const loadNavigationModule = async (options = {}) => {
         displayValue: input,
       };
     }),
-    formatOnchainAppUrl: jest.fn((input) => {
-      const raw = (input || '').trim();
-      const canonical = raw.match(/^web3:\/\/(0x[0-9a-f]{40})\.eip155-([0-9]+)([/?#].*)?$/i);
-      const friendly = raw.match(
-        /^web3:\/\/(0x[0-9a-f]{40})(?::([1-9][0-9]*))?(\/[^?#]*)?(\?[^#]*)?(#.*)?$/i
-      );
-      const match = canonical || friendly;
-      if (!match) return null;
-      const chainId = Number(match[2] || 1);
-      const rawSuffix = canonical
-        ? match[3] || '/'
-        : `${match[3] || '/'}${match[4] || ''}${match[5] || ''}`;
-      const suffix = rawSuffix.startsWith('/') ? rawSuffix : `/${rawSuffix}`;
-      return `web3://${match[1].toLowerCase()}.eip155-${chainId}${suffix}`;
-    }),
-    formatOnchainAppDisplayUrl: jest.fn((input) => {
-      const raw = (input || '').trim();
-      const canonical = raw.match(/^web3:\/\/(0x[0-9a-f]{40})\.eip155-([0-9]+)([/?#].*)?$/i);
-      const friendly = raw.match(
-        /^web3:\/\/(0x[0-9a-f]{40})(?::([1-9][0-9]*))?(\/[^?#]*)?(\?[^#]*)?(#.*)?$/i
-      );
-      const match = canonical || friendly;
-      if (!match) return null;
-      const chainId = Number(match[2] || 1);
-      const rawSuffix = canonical
-        ? match[3] || '/'
-        : `${match[3] || '/'}${match[4] || ''}${match[5] || ''}`;
-      const suffix = rawSuffix.startsWith('/') ? rawSuffix : `/${rawSuffix}`;
-      return `web3://${match[1].toLowerCase()}${chainId === 1 ? '' : `:${chainId}`}${suffix}`;
-    }),
-    looksLikeOnchainAppInput: jest.fn((input) => /^web3:/i.test((input || '').trim())),
+    formatOnchainAppUrl: jest.fn((input) =>
+      jest.requireActual('./url-utils.js').formatOnchainAppUrl(input)
+    ),
+    formatOnchainAppDisplayUrl: jest.fn((input, names) =>
+      jest.requireActual('./url-utils.js').formatOnchainAppDisplayUrl(input, names)
+    ),
+    parseOnchainAppUrl: (input) => jest.requireActual('./url-utils.js').parseOnchainAppUrl(input),
+    getOnchainNameKey: (input) => jest.requireActual('./url-utils.js').getOnchainNameKey(input),
+    getOnchainNamePair: (...args) => jest.requireActual('./url-utils.js').getOnchainNamePair(...args),
+    looksLikeOnchainAppInput: jest.fn((input) => /^(?:web3|w3):/i.test((input || '').trim())),
     deriveDisplayValue: jest.fn((url) => `display:${url}`),
     deriveBzzBaseFromUrl: jest.fn((url) =>
       url.includes('/bzz/') ? 'https://gateway.example/bzz/hash/' : null
@@ -2062,6 +2040,14 @@ describe('navigation', () => {
       expect(ctx.activeRef.tab.navigationState.pendingNavigationUrl).toBe(CANONICAL);
     });
 
+    test.each(['app.eth', 'app.box', 'app.wei', 'app.gwei'])('loads a web3 name through its chain-scoped origin: %s', async (name) => {
+      const ctx = await loadNavigationModule();
+      await ctx.mod.initNavigation();
+      ctx.mod.loadTarget(`w3://${name}:11155111/html`);
+      expect(ctx.activeRef.tab.webview.loadURL).toHaveBeenCalledWith(`web3://${name}.eip155-11155111/html`);
+      expect(ctx.elements.addressInput.value).toBe(`web3://${name}:11155111/html`);
+    });
+
     test('preserves app routes while canonicalizing the origin', async () => {
       const ctx = await loadNavigationModule();
       await ctx.mod.initNavigation();
@@ -2948,6 +2934,27 @@ describe('navigation', () => {
       await flushMicrotasks();
       return ctx.activeRef.tab.webview.loadURL.mock.calls;
     };
+
+    test('opens a bare name with a contentcontract website under the contract identity', async () => {
+      const ctx = await setupEnsDispatch();
+      const address = '0x2222222222222222222222222222222222222222';
+      const calls = await dispatchEns(ctx, 'app.wei', {
+        type: 'ok', name: 'app.wei', protocol: 'web3',
+        uri: `web3://${address}:8453/`, trust: { level: 'verified' },
+      });
+      expect(calls.at(-1)[0]).toBe(`web3://${address}.eip155-8453/`);
+      expect(ctx.elements.addressInput.value).toBe('web3://app.wei/');
+    });
+
+    test('does not override an asserted transport with a contract website', async () => {
+      const ctx = await setupEnsDispatch();
+      const calls = await dispatchEns(ctx, 'ipfs://app.wei', {
+        type: 'ok', name: 'app.wei', protocol: 'web3',
+        uri: 'web3://0x2222222222222222222222222222222222222222:1/', trust: { level: 'verified' },
+      });
+      expect(calls).toHaveLength(0);
+      expect(global.alert).toHaveBeenCalledWith(expect.stringContaining('resolves to web3, not ipfs'));
+    });
 
     test('conflict result routes to ens-conflict interstitial', async () => {
       const ctx = await setupEnsDispatch();
@@ -4383,6 +4390,22 @@ describe('navigation', () => {
       expect(ctx.electronAPI.resolveEns).toHaveBeenCalledWith('vitalik.eth');
       expect(ctx.activeRef.tab.webview.reload).not.toHaveBeenCalled();
       expect(ctx.activeRef.tab.webview.reloadIgnoringCache).not.toHaveBeenCalled();
+    });
+
+    test('reload of a named web3 page resolves its original name-service chain, ignoring address-bar drafts', async () => {
+      const ctx = await loadNavigationModule();
+      await ctx.mod.initNavigation();
+      commitDisplay(ctx, 'web3://app.eth:11155111/Html?returns=(string)#Home');
+      ctx.elements.addressInput.value = 'web3://other.eth/';
+      ctx.activeRef.tab.webview.getURL.mockReturnValue(
+        'web3://0x2222222222222222222222222222222222222222.eip155-8453/Html?returns=(string)#Home'
+      );
+      ctx.elements.reloadBtn.dispatch('click', { shiftKey: false });
+      expect(ctx.activeRef.tab.webview.loadURL).toHaveBeenCalledWith(
+        'web3://app.eth.eip155-11155111/Html?returns=(string)#Home'
+      );
+      expect(ctx.activeRef.tab.webview.reload).not.toHaveBeenCalled();
+      expect(ctx.elements.addressInput.value).toBe('web3://app.eth:11155111/Html?returns=(string)#Home');
     });
 
     test('reload of a non-ENS page falls through to webview.reload()', async () => {
