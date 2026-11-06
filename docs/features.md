@@ -138,6 +138,7 @@ Input that is not a URL, hash, or name is sent to your search engine — DuckDuc
 
 - **Draft ERC-8244 support**: `web3://<contract>:<chainId>/` loads an application whose HTML lives in contract storage. The chain ID is optional and defaults to Ethereum mainnet.
 - **Names**: `web3://app.eth/`, or plain `app.eth` when the name has no contenthash, follows the ERC-6821 `contentcontract` record, then the address record. The name stays in the address bar, history and bookmarks while the app runs under its contract's origin. ENSv2 subnames work too, including names whose resolver serves only a few record types.
+- **Network access**: an onchain app has none by default. Its first blocked connection asks you, and an allow covers that one version of the app, reloading it with connections, workers and WebAssembly enabled. Remove it from the address-bar permission indicator or Settings. Private windows never offer it.
 - **Contract calls**: other paths follow ERC-4804 with the ERC-6860 corrections, in both manual and automatic mode. A path that names no method of an `html()` contract opens the document, so client-side routes survive a reload.
 - **No gateway**: The document is read through the same chain-data router the wallet uses, not an HTTP gateway or a page-selected RPC endpoint.
 - **Chain-scoped origin**: Each contract-and-chain pair gets its own web-storage origin and wallet permission key; the wallet provider is pinned to the app's chain and `wallet_switchEthereumChain` cannot move it.

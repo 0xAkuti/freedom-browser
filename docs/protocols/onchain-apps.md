@@ -94,6 +94,18 @@ The app receives the existing EIP-1193/EIP-6963 wallet provider; reads and appro
 
 Private windows can render the document but continue to omit wallet providers, matching every other protocol.
 
+## Network access
+
+Some apps cannot work without the network: a light client, a mixnet or a payment relay has to reach something beyond the chain. The default policy above still applies to every document, so the user decides per app.
+
+The document's first blocked connection or worker raises the normal site permission prompt, so an app that never needs the network never asks. The preload only reports that a trusted `securitypolicyviolation` fired in the top frame; main takes the contract, chain and document hash from its own record of what it served, and asks at most once per document. Dismissals follow the usual embargo.
+
+Allowing reloads the app, and the response carries `connect-src https: wss:`, `worker-src blob:` and `'wasm-unsafe-eval'` in `script-src`. Every other directive, the sandbox and the wallet behaviour stay as they were. Plain `http:` and `ws:` stay blocked, so the grant does not reach a local node.
+
+The decision is stored as `network:<document hash>` under the contract and chain, so it covers one version: a contract that serves different HTML asks again. An app opened by name is keyed on its contract, so repointing a name never carries the grant over. The trust popover lists the grant while it applies. It can be removed from the address-bar permission indicator or Settings, and removing it reloads the app under the default policy. Private windows never offer or honor a grant.
+
+This is a deliberate, user-granted exception to the no-network rendering rule in the ERC-8244 draft. With the grant the app can send anything it knows, including the user's IP address and connected account, to any server.
+
 ## Scope
 
 Registry fallback and upgrade-policy discovery, described as optional extensions in the ERC, are not inferred by the browser; an upgrade-aware resolver contract can expose its own `html()` result.

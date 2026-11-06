@@ -1,0 +1,3 @@
+- Onchain apps can ask for network access, for one version at a time.
+  - Apps stay offline by default, and the first blocked connection asks you.
+  - Remove access from the address bar or Settings; private windows never offer it.
