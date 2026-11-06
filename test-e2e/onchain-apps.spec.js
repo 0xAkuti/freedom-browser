@@ -197,6 +197,72 @@ test('loads a contract-hosted app under its web3 contract-and-chain origin', asy
     });
 });
 
+test('opens a bare name whose address serves html() without website records', async ({ window, harness }) => {
+  const address = '0x0000000d42137547140b0812e1178f025e08bc49';
+  const url = `web3://${address}.eip155-1/`;
+  await harness.setEnsFixture('anon.wei', {
+    type: 'ok', name: 'anon.wei', system: 'wns', protocol: 'web3',
+    uri: `web3://${address}:1/`, decoded: address, trust: { level: 'verified' },
+  });
+  await harness.setContentFixture(url, {
+    body: '<!doctype html><title>anon.wei</title><h1 id="app">Address-record html() website</h1>',
+    headers: {
+      [PROVENANCE_HEADER]: encodeOnchainProvenance({
+        version: 1, chainId: 1, network: 'Ethereum', contract: address,
+        htmlHash: HTML_HASH, trust: { level: 'verified', method: 'myotis' },
+      }),
+    },
+  });
+  // Reload goes through the named URL and follows the protocol's internal
+  // redirect. The fixture exercises the same webRequest provenance capture.
+  await harness.setContentFixture('web3://anon.wei.eip155-1/', {
+    status: 302, headers: { Location: url },
+  });
+  await expect.poll(() => window.evaluate(() =>
+    document.querySelector('webview:not(.hidden)')?.getURL() || ''
+  )).toContain('/pages/home.html');
+  const input = window.locator('[data-test="address-input"]');
+  await input.fill('anon.wei');
+  await input.press('Enter');
+  await expect.poll(() => pageReady(window, `web3://${address}.eip155-1`)).toBe(true);
+  await expect(input).toHaveValue('web3://anon.wei/');
+  await expect.poll(() => window.evaluate(async () => {
+    const webview = document.querySelector('webview:not(.hidden)');
+    if (!webview) return null;
+    return webview.executeJavaScript('document.title');
+  })).toBe('anon.wei');
+  await expect.poll(() => window.evaluate(async () =>
+    (await window.electronAPI.getHistory()).some((row) => row.url === 'web3://anon.wei/')
+  )).toBe(true);
+  await expect(window.locator('#trust-shield')).toBeVisible();
+  await window.locator('#trust-shield').click();
+  await expect(window.locator('#trust-popover-content-fields')).toContainText(`Contract: ${address}`);
+  await window.locator('#trust-shield').click();
+
+  const firstTabId = await window.locator('[data-test="tab"].active').getAttribute('data-tab-id');
+  await window.locator('[data-test="new-tab-btn"]').click();
+  await harness.setContentFixture('web3://other.wei.eip155-1/', {
+    status: 302, headers: { Location: url },
+  });
+  await input.fill('web3://other.wei/');
+  await input.press('Enter');
+  await expect.poll(() => pageReady(window, `web3://${address}.eip155-1`)).toBe(true);
+  await expect(input).toHaveValue('web3://other.wei/');
+  await expect.poll(() => window.evaluate(async () =>
+    (await window.electronAPI.getHistory()).some((row) => row.url === 'web3://other.wei/')
+  )).toBe(true);
+  await window.locator(`[data-test="tab"][data-tab-id="${firstTabId}"]`).click();
+  await expect(input).toHaveValue('web3://anon.wei/');
+
+  await window.locator('#reload-btn').click();
+  await expect(input).toHaveValue('web3://anon.wei/');
+  await expect.poll(() => pageReady(window, `web3://${address}.eip155-1`)).toBe(true);
+  // Entering the contract deliberately should still show the address.
+  await input.fill(`web3://${address}/`);
+  await input.press('Enter');
+  await expect(input).toHaveValue(`web3://${address}/`);
+});
+
 test('shows the browser-owned gate before unverified onchain app code can run', async ({
   window,
   harness,
