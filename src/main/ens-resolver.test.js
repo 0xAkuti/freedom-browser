@@ -1435,6 +1435,53 @@ describe('ens-resolver', () => {
       );
     });
 
+    describe('a resolver without the requested profile', () => {
+      const abi = actualEthers.AbiCoder.defaultAbiCoder();
+      const node = actualEthers.namehash('1.app.example.eth');
+      const unsupported = '0x7b1c461bbc1c58d1' + '0'.repeat(56);
+      const revert = (data) => Object.assign(new Error('execution reverted'), { data });
+      const provider = () => new ethers.JsonRpcProvider('http://localhost:8545');
+
+      test.each([
+        ['contenthash', `0xbc1c58d1${node.slice(2)}`, abi.encode(['bytes'], ['0x'])],
+        ['addr', `0x3b3b57de${node.slice(2)}`, abi.encode(['address'], [actualEthers.ZeroAddress])],
+        [
+          'text',
+          new actualEthers.Interface(['function text(bytes32,string)'])
+            .encodeFunctionData('text', [node, 'contentcontract']),
+          abi.encode(['string'], ['']),
+        ],
+      ])('reads as an empty %s record', async (_label, callData, empty) => {
+        mockUrResolve.mockRejectedValue(revert(unsupported));
+        await expect(universalResolverCall(provider(), '1.app.example.eth', callData))
+          .resolves.toEqual({ resolvedData: empty, resolverAddress: null });
+      });
+
+      test('reads the same when the UR wraps the refusal in ResolverError', async () => {
+        mockUrResolve.mockRejectedValue(
+          revert('0x95c0c752' + abi.encode(['bytes'], [unsupported]).slice(2))
+        );
+        const callData = `0xbc1c58d1${node.slice(2)}`;
+        await expect(universalResolverCall(provider(), '1.app.example.eth', callData))
+          .resolves.toMatchObject({ resolvedData: abi.encode(['bytes'], ['0x']) });
+      });
+
+      test('keeps any other resolver failure an error', async () => {
+        mockUrResolve.mockRejectedValue(
+          revert('0x95c0c752' + abi.encode(['bytes'], ['0xdeadbeef']).slice(2))
+        );
+        await expect(
+          universalResolverCall(provider(), '1.app.example.eth', `0xbc1c58d1${node.slice(2)}`)
+        ).rejects.toThrow('execution reverted');
+      });
+
+      test('does not invent a record for a profile with no empty form', async () => {
+        mockUrResolve.mockRejectedValue(revert(unsupported));
+        await expect(universalResolverCall(provider(), '1.app.example.eth', '0x12345678'))
+          .rejects.toThrow('execution reverted');
+      });
+    });
+
     test('propagates UR reverts to the caller', async () => {
       const err = new Error('execution reverted: ResolverNotFound');
       mockUrResolve.mockRejectedValue(err);

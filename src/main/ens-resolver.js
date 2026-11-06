@@ -600,6 +600,8 @@ const UR_NOT_FOUND_SELECTORS = new Set([
   '0x1e9535f2', // ResolverNotContract(bytes,address)
 ]);
 const REVERSE_MISMATCH_SELECTOR = '0xef9c03ce'; // ReverseAddressMismatch(string,bytes)
+const UNSUPPORTED_PROFILE_SELECTOR = '0x7b1c461b'; // UnsupportedResolverProfile(bytes4)
+const RESOLVER_ERROR_SELECTOR = '0x95c0c752'; // ResolverError(bytes)
 
 // ethers v6 stashes contract-revert data at either `.data` (newer wrappers)
 // or `.info.error.data` (the JSON-RPC error envelope). One reader, used by
@@ -653,6 +655,35 @@ function isResolverNotFoundError(err) {
   if (/ResolverNotFound|ResolverNotContract/i.test(msg)) return true;
   const sel = urErrorSelector(err);
   return sel !== null && UR_NOT_FOUND_SELECTORS.has(sel);
+}
+
+// A resolver that does not implement a record type is the same answer as one
+// holding an empty record. ENSv2 name-specific resolvers routinely serve only a
+// few profiles, and the UR surfaces the refusal either bare or as
+// ResolverError(bytes).
+function isUnsupportedProfileError(err) {
+  const data = getRevertData(err);
+  if (!data) return false;
+  const selector = data.slice(0, 10).toLowerCase();
+  if (selector === UNSUPPORTED_PROFILE_SELECTOR) return true;
+  if (selector !== RESOLVER_ERROR_SELECTOR) return false;
+  try {
+    const [inner] = ethers.AbiCoder.defaultAbiCoder().decode(['bytes'], '0x' + data.slice(10));
+    return inner.slice(0, 10).toLowerCase() === UNSUPPORTED_PROFILE_SELECTOR;
+  } catch {
+    return false;
+  }
+}
+
+function emptyRecordFor(callData) {
+  const abi = ethers.AbiCoder.defaultAbiCoder();
+  const selector = String(callData).slice(0, 10).toLowerCase();
+  if (selector === CONTENTHASH_SELECTOR || selector === MULTICOIN_ADDR_SELECTOR) {
+    return abi.encode(['bytes'], ['0x']);
+  }
+  if (selector === TEXT_SELECTOR) return abi.encode(['string'], ['']);
+  if (selector === ADDR_SELECTOR) return abi.encode(['address'], [ethers.ZeroAddress]);
+  return null;
 }
 
 // UR.reverse reverts with this when the claimed primary name doesn't
@@ -748,10 +779,16 @@ async function callUniversalResolver(provider, method, args, overrides) {
 
 async function universalResolverCall(provider, name, callData, overrides = {}) {
   const encodedName = ethers.dnsEncode(name, 255);
-  const [resolvedData, resolverAddress] = await callUniversalResolver(
-    provider, 'resolve', [encodedName, callData], overrides
-  );
-  return { resolvedData, resolverAddress };
+  try {
+    const [resolvedData, resolverAddress] = await callUniversalResolver(
+      provider, 'resolve', [encodedName, callData], overrides
+    );
+    return { resolvedData, resolverAddress };
+  } catch (err) {
+    const resolvedData = isUnsupportedProfileError(err) ? emptyRecordFor(callData) : null;
+    if (!resolvedData) throw err;
+    return { resolvedData, resolverAddress: null };
+  }
 }
 
 function nodeFromResolverCallData(callData) {
