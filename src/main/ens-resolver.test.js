@@ -3778,6 +3778,29 @@ describe('bare names with contentcontract websites', () => {
       type: 'ok', protocol: 'web3', uri: `web3://${address}:1/`,
     });
   });
+  test('opens a contract website behind a contenthash it cannot open', async () => {
+    const address = '0x2222222222222222222222222222222222222222';
+    mockWnsContenthash.mockResolvedValue('0x30009b6113bfa3' + 'cd'.repeat(30));
+    mockNameNftText.mockResolvedValue(address);
+    await expect(resolveEnsContent('app.wei')).resolves.toMatchObject({
+      type: 'ok', protocol: 'web3', uri: `web3://${address}:1/`,
+    });
+  });
+  test('keeps the unsupported result when no contract website exists', async () => {
+    mockWnsContenthash.mockResolvedValue('0x30009b6113bfa3' + 'cd'.repeat(30));
+    mockNameNftText.mockResolvedValue('');
+    await expect(resolveEnsContent('app.wei')).resolves.toMatchObject({
+      type: 'unsupported', reason: 'UNSUPPORTED_CONTENTHASH_FORMAT',
+    });
+  });
+  test('does not pin the unsupported result when the contract lookup fails', async () => {
+    const address = '0x2222222222222222222222222222222222222222';
+    mockWnsContenthash.mockResolvedValue('0x30009b6113bfa3' + 'cd'.repeat(30));
+    mockNameNftText.mockRejectedValue(new Error('rpc down'));
+    expect((await resolveEnsContent('app.wei')).type).toBe('unsupported');
+    mockNameNftText.mockResolvedValue(address);
+    expect((await resolveEnsContent('app.wei')).type).toBe('ok');
+  });
   test('keeps contenthash precedence over contentcontract', async () => {
     mockWnsContenthash.mockResolvedValue('0xe40101fa011b20' + 'ab'.repeat(32));
     mockNameNftText.mockResolvedValue('eth:0x2222222222222222222222222222222222222222');

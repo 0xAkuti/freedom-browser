@@ -45,7 +45,7 @@ blocked. Private sessions keep separate approvals.
 Bare names and `ens://` addresses retain contenthash precedence. A resolver that
 reverts with `UnsupportedResolverProfile` for a record holds no such record: ENSv2
 names often use a resolver serving only a few profiles, so the lookup continues
-rather than failing. When contenthash is empty, an explicit `contentcontract` record opens the contract website. If
+rather than failing. When contenthash is empty, or holds a format Freedom cannot open, an explicit `contentcontract` record opens the contract website. If
 both website records are empty, Freedom checks the name's regular address record
 for a non-empty ERC-8244 `html()` document. This supports names such as `anon.wei`
 without requiring an additional website record. Addresses that do not serve HTML

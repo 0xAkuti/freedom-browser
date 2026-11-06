@@ -2024,8 +2024,9 @@ function prefetchOnFirstData(resolvedData) {
   }
 }
 
-// Bare names retain contenthash precedence, then contentcontract. With
-// neither website record, discover html() at the regular address. The pointer
+// Bare names retain contenthash precedence, then contentcontract, which also
+// serves names whose contenthash this browser cannot open. With neither
+// website record, discover html() at the regular address. The pointer
 // is not cached: promoting or rolling back a site is one record write, and the
 // next navigation has to see it.
 async function resolveContractWebsite(normalized, nameSystem, trust) {
@@ -2147,14 +2148,24 @@ async function doResolveEnsContent(normalized) {
     log.warn(
       `[ens] UNSUPPORTED_CONTENTHASH_FORMAT for ${nameForLog(normalized)}: ${redactForLog(innerBytes)}`
     );
-    return cacheContentResult(normalized, {
+    // A record this browser cannot open does not rule out a website it can.
+    let website;
+    try {
+      website = await resolveContractWebsite(normalized, nameSystem, trust);
+      if (website.type !== 'not_found') return website;
+    } catch (err) {
+      log.warn(`[ens] Contract website lookup failed for ${nameForLog(normalized)}: ${err.message}`);
+    }
+    const unsupported = {
       type: 'unsupported',
       reason: 'UNSUPPORTED_CONTENTHASH_FORMAT',
       name: normalized,
       system: nameSystem.id,
       contentHash: innerBytes,
       trust,
-    });
+    };
+    // Only a finished lookup may be pinned: a failed one should re-probe on reload.
+    return website ? cacheContentResult(normalized, unsupported) : unsupported;
   }
 
   return cacheContentResult(normalized, {
