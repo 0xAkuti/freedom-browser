@@ -42,7 +42,7 @@ class MyotisProvider extends ethers.AbstractProvider {
   }
 }
 
-async function resolveRecord({ method, name, addressHex, coinType = 60n }) {
+async function resolveRecord({ method, name, addressHex, coinType = 60n, key }) {
   // Lazy import: ens-resolver invokes this adapter after module initialization.
   const {
     universalResolverCall,
@@ -67,15 +67,19 @@ async function resolveRecord({ method, name, addressHex, coinType = 60n }) {
       'function addr(bytes32) view returns (address)',
       'function addr(bytes32,uint256) view returns (bytes)',
       'function contenthash(bytes32) view returns (bytes)',
+      'function text(bytes32,string) view returns (string)',
     ]);
     const fn =
-      method === 'contenthash'
-        ? 'contenthash'
-        : coinType === 60n
-          ? 'addr(bytes32)'
-          : 'addr(bytes32,uint256)';
+      method === 'text'
+        ? 'text'
+        : method === 'contenthash'
+          ? 'contenthash'
+          : coinType === 60n
+            ? 'addr(bytes32)'
+            : 'addr(bytes32,uint256)';
     const args = [ethers.namehash(name)];
     if (fn === 'addr(bytes32,uint256)') args.push(coinType);
+    if (fn === 'text') args.push(key);
     const { resolvedData } = await universalResolverCall(
       provider,
       name,
@@ -84,8 +88,9 @@ async function resolveRecord({ method, name, addressHex, coinType = 60n }) {
     const [value] = iface.decodeFunctionResult(fn, resolvedData);
     return {
       ...metadata,
-      status: value === '0x' || value === ethers.ZeroAddress ? 'noRecord' : 'ok',
-      ...(method === 'contenthash' ? { dataHex: value } : { addressHex: value }),
+      status: value === '' || value === '0x' || value === ethers.ZeroAddress ? 'noRecord' : 'ok',
+      ...(method === 'text' ? { text: value }
+        : method === 'contenthash' ? { dataHex: value } : { addressHex: value }),
     };
   } catch (err) {
     if (isResolverNotFoundError(err)) return { ...metadata, status: 'noRecord' };

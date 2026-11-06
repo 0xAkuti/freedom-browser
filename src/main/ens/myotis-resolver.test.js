@@ -209,3 +209,17 @@ test('rejects oversized gateway responses before executing a callback', async ()
   await expect(resolveRecord({ method: 'addr', name: 'test.eth' })).rejects.toThrow();
   expect(mockCall).toHaveBeenCalledTimes(1);
 });
+
+
+test('reads contentcontract text through the verified Universal Resolver', async () => {
+  const value = 'eth:' + address;
+  mockCall.mockResolvedValue({
+    status: 'ok', resultHex: abi.encode(['bytes', 'address'], [abi.encode(['string'], [value]), UR]),
+  });
+  await expect(resolveRecord({ method: 'text', name: 'app.eth', key: 'contentcontract' })).resolves.toMatchObject({
+    status: 'ok', text: value,
+  });
+  const [, data] = abi.decode(['bytes', 'bytes'], '0x' + mockCall.mock.calls[0][0].data.slice(10));
+  const iface = new ethers.Interface(['function text(bytes32,string) view returns(string)']);
+  expect(iface.decodeFunctionData('text', data)[1]).toBe('contentcontract');
+});

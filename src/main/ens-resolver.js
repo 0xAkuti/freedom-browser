@@ -44,6 +44,7 @@ const GNS_ADDRESS = '0x9D51D507BC7264d4fE8Ad1cf7Fe191933A0a81d6';
 const NAME_NFT_ABI = [
   'function contenthash(bytes32 node) view returns (bytes)',
   'function addr(bytes32 node) view returns (address)',
+  'function text(bytes32 node, string key) view returns (string)',
   'function reverseResolve(address addr) view returns (string)',
 ];
 const NAME_NFT_INTERFACE = new ethers.Interface(NAME_NFT_ABI);
@@ -77,6 +78,7 @@ const CONTENTHASH_SELECTOR = '0xbc1c58d1';
 // bytes4(keccak256("addr(bytes32)"))
 const ADDR_SELECTOR = '0x3b3b57de';
 const MULTICOIN_ADDR_SELECTOR = '0xf1cb7e06';
+const TEXT_SELECTOR = '0x59d1d43c';
 
 // SLIP-0044 coin type for Ethereum mainnet, used by UR.reverse.
 const ETH_COIN_TYPE = 60n;
@@ -800,6 +802,15 @@ async function nameNftResolverCall(provider, name, callData, overrides = {}) {
     };
   }
 
+  if (selector === TEXT_SELECTOR) {
+    const [, key] = NAME_NFT_INTERFACE.decodeFunctionData('text', callData);
+    const value = await registryContract.text(node, key, contractOverrides);
+    return {
+      resolvedData: ethers.AbiCoder.defaultAbiCoder().encode(['string'], [value]),
+      resolverAddress: nameSystem.contractAddress,
+    };
+  }
+
   throw new Error(`Unsupported ${nameSystem.label} resolver selector: ${selector}`);
 }
 
@@ -1165,20 +1176,31 @@ async function tryMyotisEnsPath(name, callData, nameSystem) {
       ? 'contenthash'
       : selector === ADDR_SELECTOR || selector === MULTICOIN_ADDR_SELECTOR
         ? 'addr'
-        : null;
+        : selector === TEXT_SELECTOR
+          ? 'text'
+          : null;
   if (!method) return null;
 
   const coinType = selector === MULTICOIN_ADDR_SELECTOR
     ? BigInt('0x' + callData.slice(74)) : ETH_COIN_TYPE;
-  const rec = await resolveMyotisEnsRecord({ method, name, coinType });
+  const textKey = method === 'text'
+    ? NAME_NFT_INTERFACE.decodeFunctionData('text', callData)[1] : undefined;
+  const rec = await resolveMyotisEnsRecord({
+    method, name, coinType, ...(textKey ? { key: textKey } : {}),
+  });
   const trust = buildMyotisTrust(rec, nameSystem);
   if (rec.status === 'noRecord') {
     return {
       outcome: 'data',
       resolvedData:
-        method === 'contenthash'
-          ? ethers.AbiCoder.defaultAbiCoder().encode(['bytes'], ['0x'])
-          : ethers.AbiCoder.defaultAbiCoder().encode([selector === MULTICOIN_ADDR_SELECTOR ? 'bytes' : 'address'], [selector === MULTICOIN_ADDR_SELECTOR ? '0x' : ethers.ZeroAddress]),
+        method === 'text'
+          ? ethers.AbiCoder.defaultAbiCoder().encode(['string'], [''])
+          : method === 'contenthash'
+            ? ethers.AbiCoder.defaultAbiCoder().encode(['bytes'], ['0x'])
+            : ethers.AbiCoder.defaultAbiCoder().encode(
+                [selector === MULTICOIN_ADDR_SELECTOR ? 'bytes' : 'address'],
+                [selector === MULTICOIN_ADDR_SELECTOR ? '0x' : ethers.ZeroAddress]
+              ),
       resolverAddress: null,
       trust,
       block: rec.blockNumber ?? null,
@@ -1187,14 +1209,16 @@ async function tryMyotisEnsPath(name, callData, nameSystem) {
   if (rec.status !== 'ok') {
     throw new Error(`unexpected ${method} record shape: ${JSON.stringify(rec).slice(0, 200)}`);
   }
-  const value = method === 'contenthash' ? rec.dataHex : rec.addressHex;
-  if (!value) {
+  const value = method === 'text'
+    ? rec.text : method === 'contenthash' ? rec.dataHex : rec.addressHex;
+  if (typeof value !== 'string') {
     throw new Error(`missing ${method} value: ${JSON.stringify(rec).slice(0, 200)}`);
   }
   return {
     outcome: 'data',
     resolvedData: ethers.AbiCoder.defaultAbiCoder().encode(
-      [method === 'contenthash' || selector === MULTICOIN_ADDR_SELECTOR ? 'bytes' : 'address'],
+      [method === 'text' ? 'string'
+        : method === 'contenthash' || selector === MULTICOIN_ADDR_SELECTOR ? 'bytes' : 'address'],
       [value]
     ),
     resolverAddress: null,
@@ -1899,6 +1923,45 @@ async function consensusResolve(normalizedName, callData, kind = 'content', opti
 
 async function resolveEnsContent(name) {
   return resolveWithCache(name, ensResultCache, doResolveEnsContent, 'content');
+}
+
+// Raw ENS-compatible records for ERC-6821. This is deliberately separate
+// from wallet multicoin address lookup: a web3 URL's chain selects where
+// the name service lives, not the wallet coin type to read on mainnet.
+async function resolveWeb3Record(name, key) {
+  const normalized = fastNormalize(String(name || '').trim());
+  if (!normalized) throw new Error('Name is empty');
+  // Follow the same Myotis lifecycle restart contract as cached lookups,
+  // without retaining another cache of mutable contentcontract pointers.
+  return resolveAcrossStableLifecycle(normalized, new Map(),
+    (stableName) => doResolveWeb3Record(stableName, key), 'web3', normalized);
+}
+
+async function doResolveWeb3Record(normalized, key) {
+  const nameSystem = nameSystemForName(normalized);
+  const node = ethers.namehash(normalized);
+  const text = key != null;
+  const callData = text
+    ? NAME_NFT_INTERFACE.encodeFunctionData('text', [node, key])
+    : ADDR_SELECTOR + node.slice(2);
+  const outcome = await consensusResolve(normalized, callData, text ? 'text' : 'addr', {
+    callResolver: nameSystem.contractAddress ? nameNftResolverCall : universalResolverCall,
+    nameSystem,
+  });
+  if (outcome.outcome === 'conflict') {
+    throw Object.assign(new Error('Name resolution providers disagreed'), {
+      code: 'WEB3_RECORD_CONFLICT',
+      trust: outcome.trust,
+      groups: outcome.groups,
+    });
+  }
+  if (outcome.outcome !== 'data') {
+    throw new Error('Name resolver did not return a record');
+  }
+  const [value] = ethers.AbiCoder.defaultAbiCoder().decode(
+    [text ? 'string' : 'address'], outcome.resolvedData
+  );
+  return { value, trust: outcome.trust };
 }
 
 // Decodes the UR's ABI-encoded return, parses the multicodec content hash,
@@ -2934,6 +2997,7 @@ module.exports = {
   registerEnsIpc,
   resolveEnsContent,
   resolveEnsAddress,
+  resolveWeb3Record,
   resolveEnsReverse,
   invalidateCachedProvider,
   invalidateEnsContent,

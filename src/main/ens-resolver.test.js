@@ -23,6 +23,11 @@ jest.mock('./ens-prefetch', () => ({
   PREFETCH_TIMEOUT_MS: 10_000,
 }));
 
+const mockProbeOnchainHtml = jest.fn();
+jest.mock('./onchain/onchain-app-protocol', () => ({
+  probeOnchainHtml: (...args) => mockProbeOnchainHtml(...args),
+}));
+
 // Mock the network registry. Tests still pump a legacy-shaped settings
 // object via mockLoadSettings; the registry mock translates it into the
 // { getNetwork, getEndpoints } shape ens-resolver now reads, so existing
@@ -188,6 +193,7 @@ const mockWnsReverseResolve = jest.fn();
 const mockGnsContenthash = jest.fn();
 const mockGnsAddr = jest.fn();
 const mockGnsReverseResolve = jest.fn();
+const mockNameNftText = jest.fn();
 
 // Last URL passed to JsonRpcProvider — lets per-provider test helpers know
 // which URL they're being called on during the current ur.resolve invocation.
@@ -268,6 +274,7 @@ jest.mock('ethers', () => {
           if (lower === WNS_ADDRESS) return mockWnsAddr(...args);
           return mockWnsAddr(...args);
         },
+        text: (...args) => mockNameNftText(...args),
         reverseResolve: (...args) => {
           const lower = String(addr || '').toLowerCase();
           if (lower === GNS_ADDRESS) return mockGnsReverseResolve(...args);
@@ -295,6 +302,7 @@ const {
   registerEnsIpc,
   resolveEnsContent,
   resolveEnsAddress,
+  resolveWeb3Record,
   resolveEnsReverse,
   invalidateCachedProvider,
   clearEnsResolutionCaches,
@@ -327,6 +335,10 @@ beforeEach(() => {
   mockGnsContenthash.mockResolvedValue('0x');
   mockGnsAddr.mockResolvedValue('0x0000000000000000000000000000000000000000');
   mockGnsReverseResolve.mockResolvedValue('');
+  mockNameNftText.mockResolvedValue('');
+  mockProbeOnchainHtml.mockReset().mockResolvedValue({
+    supported: false, trust: { level: 'verified' },
+  });
   mockResolveViaColibri.mockResolvedValue({
     resolvedData: actualEthers.AbiCoder.defaultAbiCoder().encode(['string'], ['']),
     resolverAddress: WNS_ADDRESS,
@@ -3656,5 +3668,35 @@ describe('ens-resolver private-window logging', () => {
 
     await handlerFor(IPC.ENS_RESOLVE)(normalEvent, { name: 'public-site.eth' });
     expect(loggedText()).toContain('[ens] Resolved: public-site.eth');
+  });
+});
+
+
+describe('ERC-6821 raw name records', () => {
+  test('queries the contentcontract text record through ENS consensus', async () => {
+    const value = 'eth:0x2222222222222222222222222222222222222222';
+    mockUrResolve.mockResolvedValue([
+      actualEthers.AbiCoder.defaultAbiCoder().encode(['string'], [value]), WNS_ADDRESS,
+    ]);
+    await expect(resolveWeb3Record('app.eth', 'contentcontract')).resolves.toMatchObject({
+      value, trust: { level: 'verified' },
+    });
+    const data = mockUrResolve.mock.calls[0][1];
+    const iface = new actualEthers.Interface(['function text(bytes32,string) view returns(string)']);
+    expect(iface.decodeFunctionData('text', data)[1]).toBe('contentcontract');
+  });
+
+  test.each(['app.wei', 'app.gwei'])('reads NameNFT text records for %s', async (name) => {
+    mockNameNftText.mockResolvedValue('0x2222222222222222222222222222222222222222');
+    const record = await resolveWeb3Record(name, 'contentcontract');
+    expect(record.value).toBe('0x2222222222222222222222222222222222222222');
+    expect(mockNameNftText).toHaveBeenCalledWith(
+      actualEthers.namehash(name), 'contentcontract', { blockTag: FAKE_BLOCK.hash }
+    );
+  });
+
+  test('does not substitute an empty record when providers cannot resolve text', async () => {
+    mockUrResolve.mockRejectedValue(new Error('network failure'));
+    await expect(resolveWeb3Record('app.eth', 'contentcontract')).rejects.toThrow();
   });
 });
