@@ -1,0 +1,4 @@
+- Web3 contract websites through ENS, WNS, and GNS names, including contentcontract records and ERC-4804/6860 calls.
+  - Names pointing directly to an `html()` contract open without website records.
+  - Names stay visible in the address bar after resolution, reloads and tab switches.
+  - ENSv2 subnames open even when their resolver has no contenthash record type.

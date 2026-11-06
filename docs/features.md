@@ -103,7 +103,7 @@ Enter any of the following in the address bar:
 | IPFS CID      | `QmHash...` or `bafybeic...`                                                |
 | IPFS URL      | `ipfs://QmHash.../path`                                                     |
 | IPNS URL      | `ipns://k51...` or `ipns://domain.eth`                                      |
-| Onchain App   | `web3://0x0000...56c6` or `web3://0x0000...56c6:100/` (chain ID optional)   |
+| Onchain App   | `web3://0x0000...56c6`, `web3://0x0000...56c6:100/` or `web3://app.eth/`    |
 | Radicle ID    | `rad://z3gqc...`                                                            |
 | Onion URL     | `http://example.onion`                                                      |
 | Ethereum Name | `vitalik.eth`, `mysite.box`, `alice.wei`, `apoorv.gwei`, `mysite.eth/about` |
@@ -137,6 +137,8 @@ Input that is not a URL, hash, or name is sent to your search engine — DuckDuc
 ## Contract-hosted Applications (`web3://`)
 
 - **Draft ERC-8244 support**: `web3://<contract>:<chainId>/` loads an application whose HTML lives in contract storage. The chain ID is optional and defaults to Ethereum mainnet.
+- **Names**: `web3://app.eth/`, or plain `app.eth` when the name has no contenthash, follows the ERC-6821 `contentcontract` record, then the address record. The name stays in the address bar, history and bookmarks while the app runs under its contract's origin. ENSv2 subnames work too, including names whose resolver serves only a few record types.
+- **Contract calls**: other paths follow ERC-4804 with the ERC-6860 corrections, in both manual and automatic mode. A path that names no method of an `html()` contract opens the document, so client-side routes survive a reload.
 - **No gateway**: The document is read through the same chain-data router the wallet uses, not an HTTP gateway or a page-selected RPC endpoint.
 - **Chain-scoped origin**: Each contract-and-chain pair gets its own web-storage origin and wallet permission key; the wallet provider is pinned to the app's chain and `wallet_switchEthereumChain` cannot move it.
 
