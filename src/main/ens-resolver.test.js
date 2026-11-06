@@ -3747,3 +3747,117 @@ describe('ERC-6821 raw name records', () => {
     await expect(resolveWeb3Record('app.eth', 'contentcontract')).rejects.toThrow();
   });
 });
+
+
+describe('bare names with contentcontract websites', () => {
+  test.each(['app.wei', 'app.gwei'])('opens explicit contract content for %s when contenthash is empty', async (name) => {
+    mockNameNftText.mockResolvedValue('eth:0x2222222222222222222222222222222222222222');
+    await expect(resolveEnsContent(name)).resolves.toMatchObject({
+      type: 'ok', protocol: 'web3', uri: 'web3://0x2222222222222222222222222222222222222222:1/',
+      trust: { level: 'verified' },
+    });
+  });
+  test('sees a repointed contentcontract on the next navigation', async () => {
+    mockNameNftText.mockResolvedValue('0x2222222222222222222222222222222222222222');
+    expect((await resolveEnsContent('app.wei')).uri).toContain('0x2222');
+    mockNameNftText.mockResolvedValue('0x3333333333333333333333333333333333333333');
+    expect((await resolveEnsContent('app.wei')).uri).toContain('0x3333');
+  });
+  test('opens a contract website on a resolver that does not implement contenthash', async () => {
+    const abi = actualEthers.AbiCoder.defaultAbiCoder();
+    const address = '0x2222222222222222222222222222222222222222';
+    mockUrResolve.mockImplementation(async (_name, data) => {
+      if (data.startsWith('0xbc1c58d1')) {
+        throw Object.assign(new Error('execution reverted'), {
+          data: `0x7b1c461b${data.slice(2, 10)}${'0'.repeat(56)}`,
+        });
+      }
+      return [abi.encode(['string'], [address]), address];
+    });
+    await expect(resolveEnsContent('1.app.example.eth')).resolves.toMatchObject({
+      type: 'ok', protocol: 'web3', uri: `web3://${address}:1/`,
+    });
+  });
+  test('keeps contenthash precedence over contentcontract', async () => {
+    mockWnsContenthash.mockResolvedValue('0xe40101fa011b20' + 'ab'.repeat(32));
+    mockNameNftText.mockResolvedValue('eth:0x2222222222222222222222222222222222222222');
+    expect((await resolveEnsContent('app.wei')).protocol).toBe('bzz');
+    expect(mockNameNftText).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('bare names pointing directly to html() contracts', () => {
+  const address = '0x0000000d42137547140b0812E1178F025e08bc49';
+
+  test.each([
+    ['anon.wei', mockWnsAddr],
+    ['app.gwei', mockGnsAddr],
+  ])('discovers the address-record website for %s without contenthash or contentcontract', async (name, resolveAddress) => {
+    resolveAddress.mockResolvedValue(address);
+    mockProbeOnchainHtml.mockResolvedValue({ supported: true, trust: { level: 'verified' } });
+    await expect(resolveEnsContent(name)).resolves.toMatchObject({
+      type: 'ok', name, protocol: 'web3', decoded: address,
+      uri: `web3://${address.toLowerCase()}:1/`, trust: { level: 'verified' },
+    });
+    expect(mockProbeOnchainHtml).toHaveBeenCalledWith(address);
+  });
+
+  test('discovers an ENS address after both website records return empty', async () => {
+    const abi = actualEthers.AbiCoder.defaultAbiCoder();
+    mockUrResolve.mockImplementation(async (_name, data) => {
+      const selector = data.slice(0, 10);
+      if (selector === '0xbc1c58d1') return [abi.encode(['bytes'], ['0x']), WNS_ADDRESS];
+      if (selector === '0x59d1d43c') return [abi.encode(['string'], ['']), WNS_ADDRESS];
+      return [abi.encode(['address'], [address]), WNS_ADDRESS];
+    });
+    mockProbeOnchainHtml.mockResolvedValue({ supported: true, trust: { level: 'verified' } });
+    await expect(resolveEnsContent('app.eth')).resolves.toMatchObject({
+      type: 'ok', protocol: 'web3', uri: `web3://${address.toLowerCase()}:1/`,
+    });
+  });
+
+  test('keeps an explicit contentcontract ahead of the address fallback', async () => {
+    mockNameNftText.mockResolvedValue('eth:0x2222222222222222222222222222222222222222');
+    mockWnsAddr.mockResolvedValue(address);
+    const result = await resolveEnsContent('anon.wei');
+    expect(result.uri).toBe('web3://0x2222222222222222222222222222222222222222:1/');
+    expect(mockWnsAddr).not.toHaveBeenCalled();
+    expect(mockProbeOnchainHtml).not.toHaveBeenCalled();
+  });
+
+  test('does not fall back from an invalid explicit contentcontract', async () => {
+    mockNameNftText.mockResolvedValue('invalid');
+    mockWnsAddr.mockResolvedValue(address);
+    await expect(resolveEnsContent('anon.wei')).rejects.toThrow();
+    expect(mockProbeOnchainHtml).not.toHaveBeenCalled();
+  });
+
+  test('leaves addresses without html() unresolved', async () => {
+    mockWnsAddr.mockResolvedValue(address);
+    await expect(resolveEnsContent('anon.wei')).resolves.toMatchObject({
+      type: 'not_found', reason: 'EMPTY_CONTENTHASH',
+    });
+  });
+
+  test('does not probe a zero address', async () => {
+    await expect(resolveEnsContent('anon.wei')).resolves.toMatchObject({ type: 'not_found' });
+    expect(mockProbeOnchainHtml).not.toHaveBeenCalled();
+  });
+
+  test('retains unverified HTML discovery in the resulting trust', async () => {
+    mockWnsAddr.mockResolvedValue(address);
+    mockProbeOnchainHtml.mockResolvedValue({ supported: true, trust: { level: 'unverified', method: 'direct' } });
+    await expect(resolveEnsContent('anon.wei')).resolves.toMatchObject({
+      type: 'ok', trust: { level: 'unverified' },
+    });
+  });
+
+  test('does not cache transient discovery failures as missing websites', async () => {
+    mockWnsAddr.mockResolvedValue(address);
+    mockProbeOnchainHtml.mockRejectedValueOnce(new Error('RPC unavailable'));
+    await expect(resolveEnsContent('anon.wei')).rejects.toThrow('RPC unavailable');
+    mockProbeOnchainHtml.mockResolvedValue({ supported: true, trust: { level: 'verified' } });
+    await expect(resolveEnsContent('anon.wei')).resolves.toMatchObject({ type: 'ok' });
+  });
+});

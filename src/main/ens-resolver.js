@@ -2024,6 +2024,62 @@ function prefetchOnFirstData(resolvedData) {
   }
 }
 
+// Bare names retain contenthash precedence, then contentcontract. With
+// neither website record, discover html() at the regular address. The pointer
+// is not cached: promoting or rolling back a site is one record write, and the
+// next navigation has to see it.
+async function resolveContractWebsite(normalized, nameSystem, trust) {
+  const { parseContentContract, weakestTrust } = require('./onchain/web3-name-resolver');
+  let websiteTrust = trust;
+  let target = null;
+  try {
+    const record = await resolveWeb3Record(normalized, 'contentcontract');
+    websiteTrust = weakestTrust(websiteTrust, record.trust);
+    if (record.value) {
+      target = await parseContentContract(record.value);
+    } else {
+      const addressRecord = await resolveWeb3Record(normalized, null);
+      websiteTrust = weakestTrust(websiteTrust, addressRecord.trust);
+      if (addressRecord.value !== ethers.ZeroAddress) {
+        const { probeOnchainHtml } = require('./onchain/onchain-app-protocol');
+        const address = ethers.getAddress(addressRecord.value);
+        const probe = await probeOnchainHtml(address);
+        websiteTrust = weakestTrust(websiteTrust, probe.trust);
+        if (probe.supported) target = { address, chainId: 1 };
+      }
+    }
+  } catch (err) {
+    if (err.code === 'WEB3_RECORD_CONFLICT') {
+      return cacheContentResult(normalized, {
+        type: 'conflict',
+        name: normalized,
+        system: nameSystem.id,
+        trust: err.trust,
+        groups: err.groups,
+      });
+    }
+    throw err;
+  }
+  if (target) {
+    return {
+      type: 'ok',
+      name: normalized,
+      system: nameSystem.id,
+      protocol: 'web3',
+      uri: `web3://${target.address.toLowerCase()}:${target.chainId}/`,
+      decoded: target.address,
+      trust: websiteTrust,
+    };
+  }
+  return cacheContentResult(normalized, {
+    type: 'not_found',
+    reason: 'EMPTY_CONTENTHASH',
+    name: normalized,
+    system: nameSystem.id,
+    trust: websiteTrust,
+  });
+}
+
 async function doResolveEnsContent(normalized) {
   const node = ethers.namehash(normalized);
   const callData = CONTENTHASH_SELECTOR + node.slice(2);
@@ -2083,13 +2139,7 @@ async function doResolveEnsContent(normalized) {
   }
 
   if (!innerBytes || innerBytes === '0x') {
-    return cacheContentResult(normalized, {
-      type: 'not_found',
-      reason: 'EMPTY_CONTENTHASH',
-      name: normalized,
-      system: nameSystem.id,
-      trust,
-    });
+    return resolveContractWebsite(normalized, nameSystem, trust);
   }
 
   const parsed = parseContentHashBytes(innerBytes);
