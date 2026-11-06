@@ -65,8 +65,9 @@ test('searches and lookups run in the worker', async () => {
     explorerUrl: 'https://etherscan.io',
   });
   await expect(host.getCatalogChain(999)).resolves.toBeNull();
+  await expect(host.getChainIdByShortName('gno')).resolves.toBe(100);
 
-  expect(run.mock.calls.map(([op]) => op)).toEqual(['search', 'get', 'get']);
+  expect(run.mock.calls.map(([op]) => op)).toEqual(['search', 'get', 'get', 'shortName']);
   // The main thread's copy of the module never loaded the catalog.
   expect(searchOnMain).not.toHaveBeenCalled();
   expect(getOnMain).not.toHaveBeenCalled();

@@ -176,4 +176,11 @@ async function getCatalogChain(chainId) {
   };
 }
 
-module.exports = { CACHE_FILE, configure, searchChains, getCatalogChain };
+// ERC-3770 prefixes are exact chainlist short names, never fuzzy search hits.
+async function getChainIdByShortName(shortName) {
+  const chains = await loadCatalog();
+  const matches = chains.filter((chain) => chain.shortName === shortName);
+  return matches.length === 1 ? matches[0].chainId : null;
+}
+
+module.exports = { CACHE_FILE, configure, searchChains, getCatalogChain, getChainIdByShortName };

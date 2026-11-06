@@ -49,4 +49,8 @@ function getCatalogChain(chainId) {
   return runOrFallback('get', { chainId }, () => catalog.getCatalogChain(chainId));
 }
 
-module.exports = { REQUEST_TIMEOUT_MS, catalogWorker, getCatalogChain, searchChains };
+function getChainIdByShortName(shortName) {
+  return runOrFallback('shortName', { shortName }, () => catalog.getChainIdByShortName(shortName));
+}
+
+module.exports = { REQUEST_TIMEOUT_MS, catalogWorker, getCatalogChain, searchChains, getChainIdByShortName };

@@ -8,6 +8,7 @@ const catalog = require('./chain-catalog');
 const OPS = {
   search: (message) => catalog.searchChains(message.query),
   get: (message) => catalog.getCatalogChain(message.chainId),
+  shortName: (message) => catalog.getChainIdByShortName(message.shortName),
 };
 
 if (!isMainThread && parentPort) {

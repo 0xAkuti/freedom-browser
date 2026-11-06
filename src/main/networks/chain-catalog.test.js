@@ -153,3 +153,18 @@ describe('caching', () => {
     await expect(catalog.searchChains('eth')).rejects.toThrow('HTTP 503');
   });
 });
+
+
+describe('getChainIdByShortName', () => {
+  test('uses exact ERC-3770 prefixes and rejects unknown names', async () => {
+    mockFetchOnce(CATALOG);
+    await expect(catalog.getChainIdByShortName('gno')).resolves.toBe(100);
+    await expect(catalog.getChainIdByShortName('sep')).resolves.toBe(11155111);
+    await expect(catalog.getChainIdByShortName('gn')).resolves.toBeNull();
+    await expect(catalog.getChainIdByShortName('GNO')).resolves.toBeNull();
+  });
+  test('refuses ambiguous catalog prefixes', async () => {
+    mockFetchOnce([...CATALOG, { chainId: 2, shortName: 'eth' }]);
+    await expect(catalog.getChainIdByShortName('eth')).resolves.toBeNull();
+  });
+});
