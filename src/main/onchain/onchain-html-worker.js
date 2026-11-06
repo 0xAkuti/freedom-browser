@@ -4,6 +4,7 @@
 // `onchain-html.js` and `task-worker-host.js`.
 const { isMainThread, parentPort } = require('node:worker_threads');
 const { decodeHtmlDocument } = require('./onchain-html');
+const { decodeWeb3Result } = require('./web3-call');
 
 if (!isMainThread && parentPort) {
   parentPort.on('message', (message) => {
@@ -12,7 +13,9 @@ if (!isMainThread && parentPort) {
       parentPort.postMessage({
         id: message.id,
         ok: true,
-        result: decodeHtmlDocument(message.result),
+        result: message.responseOptions
+          ? decodeWeb3Result(message.result, message.responseOptions)
+          : decodeHtmlDocument(message.result),
       });
     } catch (err) {
       parentPort.postMessage({
