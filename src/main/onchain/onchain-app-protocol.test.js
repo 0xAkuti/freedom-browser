@@ -1,3 +1,8 @@
+jest.mock('electron', () => ({
+  ipcMain: { handle: jest.fn() },
+  webContents: { fromId: jest.fn() },
+}));
+
 jest.mock('../logger', () => ({
   info: jest.fn(),
   warn: jest.fn(),
@@ -29,7 +34,9 @@ const {
   handleOnchainAppRequest,
   htmlWorker,
   parseOnchainAppUrl,
+  probeOnchainHtml,
   registerOnchainAppProtocol,
+  registerOnchainProvenanceIpc,
 } = require('./onchain-app-protocol');
 const { TaskWorkerTimeout } = require('../task-worker-host');
 
@@ -330,7 +337,8 @@ describe('handleOnchainAppRequest', () => {
     });
 
     expect(stillBlocked.status).toBe(451);
-    expect(chainRequest).toHaveBeenCalledTimes(2);
+    // The new method URL also probes resolveMode before its content call.
+    expect(chainRequest).toHaveBeenCalledTimes(3);
   });
 
   test('rejects non-read methods without touching chain data', async () => {
@@ -350,12 +358,12 @@ describe('handleOnchainAppRequest', () => {
     expect(chainRequest).not.toHaveBeenCalled();
   });
 
-  test('returns 502 when the contract does not implement html()', async () => {
+  test('returns 502 when neither html() nor ERC-6860 returns valid content', async () => {
     const response = await handleOnchainAppRequest(request(appUrl()), {
       chainRequest: jest.fn(async () => ({ result: '0x', source: 'direct', verified: false })),
     });
     expect(response.status).toBe(502);
-    await expect(response.text()).resolves.toContain('did not return a valid ERC-8244');
+    await expect(response.text()).resolves.toContain('did not return valid web3 content');
   });
 
   test('rejects an oversized ABI response before decoding it', async () => {
@@ -605,7 +613,7 @@ describe('html() decoding off the main thread (#503 item 9)', () => {
       chainRequest: jest.fn(async () => ({ result: '0xzz', source: 'direct', verified: false })),
     });
     expect(response.status).toBe(502);
-    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('malformed ABI data'));
+    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('Malformed contract response'));
   });
 
   test('decodes on the main thread only when the worker cannot run', async () => {
@@ -671,5 +679,264 @@ describe('html() decoding off the main thread (#503 item 9)', () => {
     const response = await pending;
     expect(response.status).toBe(504);
     await expect(run.mock.results[0].value).rejects.toMatchObject({ name: 'AbortError' });
+  });
+});
+
+
+describe('web3 name and contract calls', () => {
+  const abi = ethers.AbiCoder.defaultAbiCoder();
+  const verified = { level: 'verified' };
+  const unverified = { level: 'unverified', method: 'direct' };
+  const resolved = (trust = verified) => ({ address: CANONICAL_ADDRESS, chainId: 8453, trust });
+  const namedUrl = 'web3://app.wei.eip155-1/html#section';
+
+  test('redirects a verified name to the resolved contract and chain before executing code', async () => {
+    const resolveName = jest.fn().mockResolvedValue(resolved());
+    const chainRequest = jest.fn();
+    const response = await handleOnchainAppRequest(request(namedUrl), { resolveName, chainRequest });
+    expect(response.status).toBe(302);
+    expect(response.headers.get('location')).toBe(`web3://${ADDRESS.toLowerCase()}.eip155-8453/html#section`);
+    expect(resolveName).toHaveBeenCalledWith('app.wei', 1);
+    expect(chainRequest).not.toHaveBeenCalled();
+  });
+
+  test('gates an unverified name even when contract code is verified', async () => {
+    const resolveName = jest.fn().mockResolvedValue(resolved(unverified));
+    const chainRequest = jest.fn().mockImplementation(async (_chain, _method, [tx]) => ({
+      result: tx.data === '0xdd473fae' ? ethers.ZeroHash : encodedHtml('<h1>named app</h1>'),
+      trust: verified,
+    }));
+    const trustState = createOnchainAppTrustState();
+    const first = await handleOnchainAppRequest(request(namedUrl), { resolveName, chainRequest, trustState });
+    expect(first.status).toBe(451);
+    const gate = gateUrl(first);
+    expect(gate.searchParams.get('contract')).toBe(CANONICAL_ADDRESS);
+    expect(gate.searchParams.get('chain')).toBe('8453');
+    const approved = request(namedUrl);
+    approved.headers.set(APPROVAL_HEADER, gate.searchParams.get('token'));
+    const response = await handleOnchainAppRequest(approved, { resolveName, chainRequest, trustState });
+    expect(response.status).toBe(302);
+    expect(response.headers.get('location')).toContain('.eip155-8453/html');
+    expect(resolveName).toHaveBeenCalledTimes(1);
+  });
+
+  test('never offers approval for conflicting name results', async () => {
+    const response = await handleOnchainAppRequest(request('web3://app.eth.eip155-1/'), {
+      resolveName: async () => resolved({ ...unverified, dissented: ['other.example'] }),
+      chainRequest: async () => ({ result: encodedHtml('<h1>app</h1>'), trust: verified }),
+      trustState: createOnchainAppTrustState(),
+    });
+    expect(response.status).toBe(451);
+    expect(gateUrl(response).searchParams.get('conflict')).toBe('1');
+    expect(gateUrl(response).searchParams.has('token')).toBe(false);
+  });
+
+  test('passes explicit sender and typed method arguments to the contract', async () => {
+    const chainRequest = jest.fn().mockImplementation(async (_chain, _method, [tx]) => ({
+      result: tx.data === '0xdd473fae' ? ethers.ZeroHash : abi.encode(['uint256'], [42]),
+      trust: verified,
+    }));
+    const from = '0x2222222222222222222222222222222222222222';
+    const response = await handleOnchainAppRequest(request(
+      `web3://${from}@${ADDRESS.toLowerCase()}.eip155-1/balanceOf/${from}?returns=(uint256)`
+    ), { chainRequest });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual(['0x2a']);
+    expect(response.headers.get('content-type')).toBe('application/json');
+    expect(chainRequest.mock.calls[1][2][0]).toEqual({
+      to: CANONICAL_ADDRESS, from,
+      data: ethers.id('balanceOf(address)').slice(0, 10) + abi.encode(['address'], [from]).slice(2),
+    });
+  });
+
+  test('falls back from absent html() to manual mode at the root', async () => {
+    const chainRequest = jest.fn().mockImplementation(async (_chain, _method, [tx]) => {
+      if (tx.data === HTML_SELECTOR) throw new Error('execution reverted');
+      return {
+        result: tx.data === '0xdd473fae' ? ethers.encodeBytes32String('manual') : abi.encode(['bytes'], [ethers.toUtf8Bytes('<h1>manual</h1>')]),
+        trust: verified,
+      };
+    });
+    const response = await handleOnchainAppRequest(request(appUrl()), { chainRequest });
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe('<h1>manual</h1>');
+    expect(chainRequest.mock.calls[2][2][0].data).toBe('0x2f');
+  });
+
+  describe('path routes of an html() document', () => {
+    const page = '<h1>app</h1>';
+    const document = (overrides = {}) => jest.fn().mockImplementation(async (_chain, _method, [tx]) => {
+      if (tx.data === HTML_SELECTOR) return { result: abi.encode(['string'], [page]), trust: verified };
+      if (tx.data === '0xdd473fae') {
+        if (overrides.mode) return { result: ethers.encodeBytes32String(overrides.mode), trust: verified };
+        throw new Error('execution reverted');
+      }
+      if (overrides.method) return { result: overrides.method, trust: verified };
+      throw new Error('execution reverted');
+    });
+
+    test('serves the document when the path names no contract method', async () => {
+      const response = await handleOnchainAppRequest(request(`${appUrl()}projects/demo`), {
+        chainRequest: document(),
+      });
+      expect(response.status).toBe(200);
+      expect(response.headers.get('content-type')).toBe('text/html; charset=utf-8');
+      expect(await response.text()).toBe(page);
+    });
+
+    test('still prefers a real contract method', async () => {
+      const response = await handleOnchainAppRequest(request(`${appUrl()}version`), {
+        chainRequest: document({ method: abi.encode(['bytes'], [ethers.toUtf8Bytes('7')]) }),
+      });
+      expect(await response.text()).toBe('7');
+    });
+
+    test('leaves a manual-mode contract in charge of its own paths', async () => {
+      const response = await handleOnchainAppRequest(request(`${appUrl()}missing.txt`), {
+        chainRequest: document({ mode: 'manual' }),
+      });
+      expect(response.status).toBe(502);
+    });
+
+    test('reports the call failure when the contract has no document either', async () => {
+      const chainRequest = jest.fn().mockRejectedValue(new Error('execution reverted'));
+      const response = await handleOnchainAppRequest(request(`${appUrl()}projects`), { chainRequest });
+      expect(response.status).toBe(502);
+    });
+  });
+
+  test('manual mode returns binary content and derives MIME from the path', async () => {
+    const chainRequest = jest.fn().mockImplementation(async (_chain, _method, [tx]) => ({
+      result: tx.data === '0xdd473fae' ? ethers.encodeBytes32String('manual') : abi.encode(['bytes'], ['0x00ff80']),
+      trust: verified,
+    }));
+    const response = await handleOnchainAppRequest(request(appUrl(1, '/Art.png?raw=a+b#ignored')), { chainRequest });
+    expect(response.status).toBe(200);
+    expect(response.headers.get('content-type')).toBe('image/png');
+    expect(Buffer.from(await response.arrayBuffer())).toEqual(Buffer.from([0, 255, 128]));
+    expect(ethers.toUtf8String(chainRequest.mock.calls[1][2][0].data)).toBe('/Art.png?raw=a+b');
+  });
+
+  test('resolves name arguments via address records and retains their trust', async () => {
+    const resolveName = jest.fn().mockResolvedValue({ address: CANONICAL_ADDRESS, chainId: 1, trust: unverified });
+    const chainRequest = jest.fn().mockImplementation(async (_chain, _method, [tx]) => ({
+      result: tx.data === '0xdd473fae' ? ethers.ZeroHash : encodedHtml('<h1>read</h1>'), trust: verified,
+    }));
+    const response = await handleOnchainAppRequest(request(appUrl(1, '/balanceOf/app.gwei')), { resolveName, chainRequest, trustState: createOnchainAppTrustState() });
+    expect(response.status).toBe(451);
+    expect(resolveName).toHaveBeenCalledWith('app.gwei', 1, { contentContract: false });
+  });
+
+  test('includes name discovery in the navigation deadline', async () => {
+    const response = await handleOnchainAppRequest(request(namedUrl), {
+      resolveName: () => new Promise(() => {}), timeoutMs: 5,
+    });
+    expect(response.status).toBe(504);
+  });
+});
+
+
+describe('ERC-8244 address-record discovery', () => {
+  const trust = { level: 'verified', method: 'myotis' };
+
+  test('detects non-empty HTML through the router and document worker', async () => {
+    const chainRequest = jest.fn().mockResolvedValue({
+      result: encodedHtml('<title>anon.wei</title><script>throw new Error("never execute")</script>'),
+      trust,
+    });
+    await expect(probeOnchainHtml(CANONICAL_ADDRESS, 1, { chainRequest })).resolves.toEqual({ supported: true, trust });
+    expect(chainRequest).toHaveBeenCalledWith(1, 'eth_call', [
+      { to: CANONICAL_ADDRESS, data: HTML_SELECTOR }, 'latest',
+    ], expect.objectContaining({ includeTrust: true, signal: expect.any(AbortSignal) }));
+  });
+
+  test.each([encodedHtml(''), '0x', '0x1234', 'not ABI data'])(
+    'does not treat an empty or invalid html() response as a website: %s', async (result) => {
+      await expect(probeOnchainHtml(CANONICAL_ADDRESS, 1, {
+        chainRequest: async () => ({ result, trust }),
+      })).resolves.toEqual({ supported: false, trust });
+    }
+  );
+
+  test('keeps unverified discovery provenance', async () => {
+    const unverified = { level: 'unverified', method: 'direct' };
+    await expect(probeOnchainHtml(CANONICAL_ADDRESS, 1, {
+      chainRequest: async () => ({ result: encodedHtml('<h1>app</h1>'), trust: unverified }),
+    })).resolves.toEqual({ supported: true, trust: unverified });
+  });
+
+  test('reports a contract revert as unsupported', async () => {
+    await expect(probeOnchainHtml(CANONICAL_ADDRESS, 1, {
+      chainRequest: async () => { throw Object.assign(new Error('execution reverted'), { code: 'CALL_EXCEPTION' }); },
+    })).resolves.toMatchObject({ supported: false });
+  });
+
+  test('propagates transient transport failures', async () => {
+    await expect(probeOnchainHtml(CANONICAL_ADDRESS, 1, {
+      chainRequest: async () => { throw new Error('RPC unavailable'); },
+    })).rejects.toThrow('RPC unavailable');
+  });
+
+  test('bounds and cancels a stalled discovery read', async () => {
+    const chainRequest = jest.fn(() => new Promise(() => {}));
+    await expect(probeOnchainHtml(CANONICAL_ADDRESS, 1, { chainRequest, timeoutMs: 5 })).rejects.toMatchObject({ name: 'AbortError' });
+    expect(chainRequest.mock.calls[0][3].signal.aborted).toBe(true);
+  });
+
+  test('refuses oversized discovery responses', async () => {
+    const result = '0x' + '00'.repeat(MAX_HTML_BYTES + 96);
+    await expect(probeOnchainHtml(CANONICAL_ADDRESS, 1, {
+      chainRequest: async () => ({ result, trust }),
+    })).rejects.toMatchObject({ code: 'ONCHAIN_APP_TOO_LARGE' });
+  });
+});
+
+describe('name display metadata on contract redirects', () => {
+  test('binds the name to the guest and exact redirect target, and consumes it once', async () => {
+    const { ipcMain, webContents } = require('electron');
+    const contents = { id: 710, hostWebContents: { id: 711 }, once: jest.fn() };
+    webContents.fromId.mockImplementation((id) => id === contents.id ? contents : null);
+    registerOnchainProvenanceIpc();
+    const read = ipcMain.handle.mock.calls.at(-1)[1];
+    const response = await handleOnchainAppRequest(request(appUrl()), {
+      chainRequest: jest.fn(async () => ({
+        result: encodedHtml('<h1>named site</h1>'), trust: { level: 'verified', method: 'myotis' },
+      })),
+    });
+    const redirect = () => captureOnchainProvenance({
+      resourceType: 'mainFrame', statusCode: 302, url: 'web3://anon.wei/',
+      responseHeaders: { Location: [appUrl()] }, webContents: contents,
+    });
+    const commit = (url = appUrl(), guest = contents) => captureOnchainProvenance({
+      resourceType: 'mainFrame', statusCode: 200, url,
+      responseHeaders: { [PROVENANCE_HEADER]: [response.headers.get(PROVENANCE_HEADER)] },
+      webContents: guest,
+    });
+    const lookup = (url = appUrl(), senderId = 711) => read(
+      { sender: { id: senderId } }, { webContentsId: contents.id, url }
+    );
+
+    redirect();
+    commit();
+    expect(lookup()).toMatchObject({ contract: CANONICAL_ADDRESS, nameUrl: 'web3://anon.wei/' });
+    expect(lookup(appUrl(), 999)).toBeNull();
+    commit();
+    expect(lookup()).not.toHaveProperty('nameUrl');
+
+    redirect();
+    commit(appUrl(100));
+    expect(lookup(appUrl(100))).not.toHaveProperty('nameUrl');
+
+    redirect();
+    captureOnchainProvenance({ resourceType: 'mainFrame', statusCode: 200,
+      url: 'https://example.com/', webContents: contents });
+    commit();
+    expect(lookup()).not.toHaveProperty('nameUrl');
+
+    redirect();
+    const destroyed = contents.once.mock.calls.find(([event]) => event === 'destroyed')[1];
+    destroyed();
+    commit();
+    expect(lookup()).not.toHaveProperty('nameUrl');
   });
 });

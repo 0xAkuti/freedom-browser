@@ -50,7 +50,7 @@ const {
 const { waitFor } = require('../../../test/helpers/fake-http-node');
 
 const ADDRESS = '0x00000095643CFfA7D9fae407a84dfCB6406456c6';
-const APP_URL = `web3://${ADDRESS.toLowerCase()}.eip155-1/swap?pair=eth`;
+const APP_URL = `web3://${ADDRESS.toLowerCase()}.eip155-1/`;
 const HTML = '<!doctype html><title>app</title><script>window.ran = true</script>';
 const OTHER_HTML = '<!doctype html><title>changed</title>';
 

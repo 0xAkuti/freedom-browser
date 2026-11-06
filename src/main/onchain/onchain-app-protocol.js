@@ -1,9 +1,9 @@
 /**
- * ERC-8244 contract-hosted application protocol.
+ * ERC-4804/6860 web3 protocol with ERC-6821 names and ERC-8244 discovery.
  *
- * Freedom maps `web3://<contract>.eip155-<chainId>/` to a read-only `eth_call` of
- * `html()` (`0x33c34ac3`). The returned UTF-8 document is served as the
- * top-level response under the contract-and-chain-scoped `web3:` origin.
+ * Root URLs prefer the read-only `html()` interface (`0x33c34ac3`). Other
+ * URLs translate paths and queries into read-only EVM calls. Name URLs
+ * resolve before executing code under a contract-and-chain-scoped origin.
  * Network access from the document is denied by response policy; Ethereum
  * reads and signing continue through Freedom's existing EIP-1193 bridge.
  */
@@ -15,9 +15,11 @@ const { ethers } = require('ethers');
 const log = require('../logger');
 const chainData = require('../networks/chain-data-router');
 const networkRegistry = require('../networks/network-registry');
-const { getPermissionKey } = require('../../shared/origin-utils');
+const { getPermissionKey, parseWeb3Url } = require('../../shared/origin-utils');
+const { resolveWeb3Name, weakestTrust } = require('./web3-name-resolver');
+const { RESOLVE_MODE_SELECTOR, buildWeb3Call, decodeWeb3Result, resolveMode } = require('./web3-call');
 const { registerWebRequestHandler } = require('../webrequest-dispatcher');
-const { createTaskWorkerHost, TaskWorkerUnavailable } = require('../task-worker-host');
+const { createTaskWorkerHost, TaskWorkerUnavailable, TaskWorkerTimeout } = require('../task-worker-host');
 const {
   MAX_HTML_BYTES,
   assertHtmlResultSize,
@@ -27,6 +29,7 @@ const {
 const {
   runWithPrivateLogContext,
   redactUrlForLog,
+  redactForLog,
 } = require('../private/private-log-context');
 
 const HTML_SELECTOR = '0x33c34ac3';
@@ -92,25 +95,13 @@ const ONCHAIN_APP_PERMISSIONS_POLICY = [
 ].join(', ');
 
 function parseOnchainAppUrl(input) {
-  const raw = typeof input === 'string' ? input.trim() : '';
-  const canonicalMatch = raw.match(
-    /^web3:\/\/(0x[0-9a-f]{40})\.eip155-([0-9]+)(?:[/?#]|$)/i
-  );
-  // Also accept the typed shorthand at this boundary for testability and
-  // defensive compatibility. Renderer navigation always loads the canonical
-  // hostname-safe form before Chromium creates the request.
-  const friendlyMatch = raw.match(
-    /^web3:\/\/(0x[0-9a-f]{40})(?::([0-9]+))?(?:[/?#]|$)/i
-  );
-  const match = canonicalMatch || friendlyMatch;
-  if (!match || !ETHEREUM_ADDRESS_RE.test(match[1])) return null;
-
-  const chainId = Number(match[2] || DEFAULT_CHAIN_ID);
-  if (!Number.isSafeInteger(chainId) || chainId <= 0) return null;
-
+  const parsed = parseWeb3Url(input);
+  if (!parsed) return null;
   return {
-    address: ethers.getAddress(match[1]),
-    chainId,
+    address: parsed.address ? ethers.getAddress(parsed.address) : null,
+    ...(parsed.name ? { name: parsed.name } : {}),
+    ...(parsed.from ? { from: parsed.from } : {}),
+    chainId: parsed.chainId,
   };
 }
 
@@ -192,13 +183,14 @@ function createOnchainAppTrustState({
         !candidate ||
         candidate.expiresAt <= now() ||
         candidate.requestUrl !== documentUrl(requestUrl) ||
-        candidate.app.chainId !== app.chainId ||
-        candidate.app.address !== app.address
+        (candidate.requestApp || candidate.app).chainId !== app.chainId ||
+        (candidate.requestApp || candidate.app).address !== app.address ||
+        (candidate.requestApp || candidate.app).name !== app.name
       ) {
         return null;
       }
 
-      const approvalKey = documentApprovalKey(app, candidate.provenance.htmlHash);
+      const approvalKey = documentApprovalKey(candidate.app, candidate.provenance.htmlHash);
       if (!approvedDocuments.has(approvalKey) && approvedDocuments.size >= MAX_APPROVED_DOCUMENTS) {
         approvedDocuments.delete(approvedDocuments.values().next().value);
       }
@@ -234,9 +226,9 @@ function decodeOnchainProvenance(value) {
   }
 }
 
-function htmlResponse(html, app, provenance, chainResult, method) {
+function htmlResponse(html, app, provenance, chainResult, method, contentType = 'text/html; charset=utf-8') {
   const headers = {
-    'Content-Type': 'text/html; charset=utf-8',
+    ...(contentType ? { 'Content-Type': contentType } : {}),
     'Cache-Control': 'no-store',
     'Content-Security-Policy': ONCHAIN_APP_CSP,
     'Permissions-Policy': ONCHAIN_APP_PERMISSIONS_POLICY,
@@ -301,8 +293,11 @@ function decodeGateUrl(value, requestUrl) {
     const target = url.searchParams.get('target');
     const app = parseOnchainAppUrl(target);
     if (!app || documentUrl(target) !== documentUrl(requestUrl)) return null;
-    if (url.searchParams.get('chain') !== String(app.chainId)) return null;
-    if (url.searchParams.get('contract') !== app.address) return null;
+    if (!app.name && url.searchParams.get('chain') !== String(app.chainId)) return null;
+    if (!app.name && url.searchParams.get('contract') !== app.address) return null;
+    if (!ETHEREUM_ADDRESS_RE.test(url.searchParams.get('contract') || '')) return null;
+    const resolvedChain = Number(url.searchParams.get('chain'));
+    if (!Number.isSafeInteger(resolvedChain) || resolvedChain <= 0) return null;
     if (!/^0x[0-9a-f]{64}$/i.test(url.searchParams.get('hash') || '')) return null;
 
     const conflict = url.searchParams.get('conflict') === '1';
@@ -357,26 +352,26 @@ async function withDeadline(promise, timeoutMs, signal) {
 // thread. Done here instead only when the worker cannot start, or crashes
 // while on this very document (see task-worker-host.js) — then this one
 // document costs the main thread its ~1 s, as it did before the worker.
-async function decodeHtmlInWorker(result, signal) {
+async function decodeHtmlInWorker(result, signal, responseOptions) {
   // O(1), before an oversized result is copied to the worker at all.
   assertHtmlResultSize(result);
   try {
-    return await htmlWorker.run('decode', { result }, { signal });
+    return await htmlWorker.run('decode', { result, responseOptions }, { signal });
   } catch (error) {
     if (!(error instanceof TaskWorkerUnavailable)) throw error;
     if (signal?.aborted) throw abortError('onchain app request aborted');
-    return decodeHtmlDocument(result);
+    return responseOptions ? decodeWeb3Result(result, responseOptions) : decodeHtmlDocument(result);
   }
 }
 
 // The decode shares the request's deadline and cancellation with the chain
 // read: a navigation that was aborted, or has used up its budget, stops
 // holding (or waiting for) the single decode worker.
-async function decodeWithinDeadline(result, remainingMs, signal) {
+async function decodeWithinDeadline(result, remainingMs, signal, responseOptions) {
   const controller = new AbortController();
   try {
     return await withDeadline(
-      decodeHtmlInWorker(result, controller.signal),
+      decodeHtmlInWorker(result, controller.signal, responseOptions),
       Math.max(0, remainingMs),
       signal
     );
@@ -387,12 +382,57 @@ async function decodeWithinDeadline(result, remainingMs, signal) {
   }
 }
 
+// A bare name's address is only a website when it implements ERC-8244.
+// Reuse the document worker and the navigation deadline without retaining
+// the HTML in the name cache or executing any of it during discovery.
+async function probeOnchainHtml(address, chainId = DEFAULT_CHAIN_ID, {
+  chainRequest = chainData.request,
+  timeoutMs = REQUEST_TIMEOUT_MS,
+  signal,
+} = {}) {
+  const startedAt = Date.now();
+  const controller = new AbortController();
+  try {
+    signal?.throwIfAborted();
+    const chainResult = await withDeadline(Promise.resolve().then(() => chainRequest(
+      chainId,
+      'eth_call',
+      [{ to: ethers.getAddress(address), data: HTML_SELECTOR }, 'latest'],
+      {
+        includeTrust: true,
+        signal: controller.signal,
+        routingContext: { origin: getPermissionKey(`web3://${address}:${chainId}/`) },
+      }
+    )), timeoutMs, signal);
+    const trust = chainResult?.trust || {
+      level: chainResult?.verified === true ? 'verified' : 'unverified',
+      method: chainResult?.source || 'direct',
+    };
+    try {
+      const { html } = await decodeWithinDeadline(
+        chainResult?.result, timeoutMs - (Date.now() - startedAt), signal
+      );
+      return { supported: html.length > 0, trust };
+    } catch (error) {
+      if (error?.name === 'AbortError' || error?.code === 'ONCHAIN_APP_TOO_LARGE' ||
+          error instanceof TaskWorkerTimeout) throw error;
+      return { supported: false, trust };
+    }
+  } catch (error) {
+    if (error?.code === 'CALL_EXCEPTION') return { supported: false, trust: { level: 'unverified' } };
+    throw error;
+  } finally {
+    controller.abort();
+  }
+}
+
 async function handleOnchainAppRequest(
   request,
   {
     chainRequest = chainData.request,
     timeoutMs = REQUEST_TIMEOUT_MS,
     trustState = standaloneTrustState,
+    resolveName = resolveWeb3Name,
   } = {}
 ) {
   const method = (request.method || 'GET').toUpperCase();
@@ -402,36 +442,60 @@ async function handleOnchainAppRequest(
     });
   }
 
-  const app = parseOnchainAppUrl(request.url);
-  if (!app) {
+  const requestApp = parseOnchainAppUrl(request.url);
+  if (!requestApp) {
     return textResponse(
       400,
-      'invalid onchain application URL; expected web3://<contract>.eip155-<chainId>/'
+      'invalid web3 URL; expected web3://<contract-or-name>:<chainId>/'
     );
   }
 
   if (method === 'GET') {
     const approvalToken = requestHeader(request, APPROVAL_HEADER);
-    const approvedCandidate = trustState.consume(approvalToken, request.url, app);
+    const approvedCandidate = trustState.consume(approvalToken, request.url, requestApp);
     if (approvedCandidate) {
+      if (approvedCandidate.redirectUrl) return redirectResponse(approvedCandidate.redirectUrl);
       return htmlResponse(
         approvedCandidate.html,
         approvedCandidate.app,
         approvedCandidate.provenance,
         approvedCandidate.chainResult,
-        method
+        method,
+        approvedCandidate.contentType
       );
     }
   }
 
   const startedAt = Date.now();
   try {
-    const chainResult = await withDeadline(
-      Promise.resolve(
-        chainRequest(
+    let app = requestApp;
+    let redirectUrl = null;
+    let nameTrust = null;
+    const parsed = parseWeb3Url(request.url);
+    const withinDeadline = (promise) => withDeadline(
+      promise, Math.max(0, timeoutMs - (Date.now() - startedAt)), request.signal
+    );
+    if (app.name) {
+      const resolved = await withinDeadline(resolveName(app.name, app.chainId));
+      app = { address: resolved.address, chainId: resolved.chainId, ...(app.from ? { from: app.from } : {}) };
+      nameTrust = resolved.trust || { level: 'unverified' };
+      const sender = app.from ? `${app.from}@` : '';
+      redirectUrl = `web3://${sender}${app.address.toLowerCase()}.eip155-${app.chainId}${parsed.path}${parsed.query}${parsed.fragment}`;
+      // Navigation reaches the contract origin before any app code executes.
+      // This pins storage and the wallet provider to the resolved chain even
+      // when contentcontract changes it via an ERC-3770 prefix.
+      if (isTrusted(nameTrust)) return redirectResponse(redirectUrl);
+    }
+    const call = (data, explicitSender = false) => {
+      const transaction = {
+        to: app.address,
+        data,
+        ...(app.from || explicitSender ? { from: app.from || ethers.ZeroAddress } : {}),
+      };
+      return withinDeadline(Promise.resolve().then(() => chainRequest(
           app.chainId,
           'eth_call',
-          [{ to: app.address, data: HTML_SELECTOR }, 'latest'],
+          [transaction, 'latest'],
           {
             includeTrust: true,
             // The document fetch is the first app-driven read. Give it the
@@ -439,25 +503,80 @@ async function handleOnchainAppRequest(
             // EIP-1193 calls the loaded document will make afterwards.
             routingContext: { origin: getPermissionKey(request.url) },
           }
-        )
-      ),
-      timeoutMs,
-      request.signal
+        )));
+    };
+    const decode = (result, options) => decodeWithinDeadline(
+      result, timeoutMs - (Date.now() - startedAt), request.signal, options
     );
-    const { html, htmlHash } = await decodeWithinDeadline(
-      chainResult?.result,
-      timeoutMs - (Date.now() - startedAt),
-      request.signal
-    );
+    let chainResult;
+    let decoded;
+    // ERC-8244 discovery at the root remains the preferred single-call path.
+    // Explicit method URLs always retain ERC-6860 semantics.
+    if (parsed.path === '/' && !parsed.query) {
+      try {
+        chainResult = await call(HTML_SELECTOR);
+        decoded = await decode(chainResult?.result);
+        if (!decoded.html) decoded = null;
+      } catch (error) {
+        if (error?.name === 'AbortError' || error?.code === 'ONCHAIN_APP_TOO_LARGE') throw error;
+      }
+    }
+    let argumentTrust = null;
+    if (!decoded) {
+      const triedHtml = parsed.path === '/' && !parsed.query;
+      let mode = 'auto';
+      try {
+        let modeResult;
+        try {
+          modeResult = await call(RESOLVE_MODE_SELECTOR, true);
+        } catch (error) {
+          if (error?.name === 'AbortError') throw error;
+        }
+        mode = resolveMode(modeResult?.result);
+        const options = await withinDeadline(buildWeb3Call(parsed, mode, async (name) => {
+          const resolved = await resolveName(name, parsed.chainId, { contentContract: false });
+          argumentTrust = weakestTrust(argumentTrust, resolved.trust || { level: 'unverified' });
+          return resolved.address;
+        }));
+        chainResult = await call(options.data, true);
+        chainResult = {
+          ...chainResult,
+          trust: weakestTrust(
+            chainResult?.trust || { level: chainResult?.verified ? 'verified' : 'unverified' },
+            modeResult?.trust,
+            argumentTrust
+          ),
+        };
+        decoded = await decode(chainResult?.result, options);
+      } catch (error) {
+        if (
+          triedHtml || mode === 'manual' ||
+          error?.name === 'AbortError' || error?.code === 'ONCHAIN_APP_TOO_LARGE'
+        ) {
+          throw error;
+        }
+        // A path that names no contract method is an ERC-8244 client route.
+        // A reloaded deep link keeps opening the app's document.
+        chainResult = await call(HTML_SELECTOR);
+        decoded = await decode(chainResult?.result);
+        if (!decoded.html) throw error;
+      }
+    }
+    const { html, htmlHash } = decoded;
+    const contentType = Object.hasOwn(decoded, 'contentType')
+      ? decoded.contentType || null : 'text/html; charset=utf-8';
+    if (nameTrust) chainResult = { ...chainResult, trust: weakestTrust(chainResult?.trust, nameTrust) };
     const provenance = buildOnchainProvenance(htmlHash, app, chainResult || {});
-    const trustLevel = provenance.trust?.level;
-    const trusted = trustLevel === 'verified' || trustLevel === 'user-configured';
+    const trusted = isTrusted(provenance.trust);
     if (method === 'GET' && !trusted && !trustState.isApproved(app, provenance.htmlHash)) {
       const conflict = hasTrustConflict(provenance.trust);
       const token = conflict
         ? null
         : trustState.stage({
             app,
+            requestApp,
+            redirectUrl,
+            contentType,
             chainResult: chainResult || {},
             html,
             provenance,
@@ -467,7 +586,8 @@ async function handleOnchainAppRequest(
         buildOnchainInterstitialUrl({ app, provenance, requestUrl: request.url, token })
       );
     }
-    return htmlResponse(html, app, provenance, chainResult || {}, method);
+    if (redirectUrl) return redirectResponse(redirectUrl);
+    return htmlResponse(html, app, provenance, chainResult || {}, method, contentType);
   } catch (error) {
     const loggedUrl = redactUrlForLog(request.url);
     if (error?.code === 'ONCHAIN_APP_TOO_LARGE') {
@@ -478,12 +598,20 @@ async function handleOnchainAppRequest(
       log.warn(`[onchain-app] timed out loading ${loggedUrl}`);
       return textResponse(504, 'onchain application read timed out');
     }
-    log.warn(`[onchain-app] failed to load ${loggedUrl}: ${error?.message || error}`);
+    log.warn(`[onchain-app] failed to load ${loggedUrl}: ${redactForLog(error?.message || error)}`);
     return textResponse(
       502,
-      'the contract did not return a valid ERC-8244 html() document on this chain'
+      'the name or contract did not return valid web3 content on this chain'
     );
   }
+}
+
+function isTrusted(trust) {
+  return trust?.level === 'verified' || trust?.level === 'user-configured';
+}
+
+function redirectResponse(location) {
+  return new Response(null, { status: 302, headers: { Location: location, 'Cache-Control': 'no-store' } });
 }
 
 function responseHeader(responseHeaders, name) {
@@ -532,7 +660,30 @@ function captureOnchainProvenance(details) {
     const responseHeaders = withoutGateHeader(details?.responseHeaders);
     return responseHeaders ? { responseHeaders } : null;
   }
+  const contents = details.webContents;
+  const previous = provenanceByWebContentsId.get(contents?.id);
+  provenanceByWebContentsId.delete(contents?.id);
   if (!documentUrl(details.url).startsWith('web3://')) return null;
+  if (contents?.id && !observedWebContentsIds.has(contents.id)) {
+    observedWebContentsIds.add(contents.id);
+    contents.once?.('destroyed', () => {
+      provenanceByWebContentsId.delete(contents.id);
+      observedWebContentsIds.delete(contents.id);
+    });
+  }
+  // Preserve only a redirect issued by our name resolver, for this guest and
+  // this exact destination. The renderer reuses it for chrome display only;
+  // storage and wallet identity continue to use the actual contract origin.
+  const namedSource = parseWeb3Url(details.url);
+  const redirectTarget = parseWeb3Url(responseHeader(details.responseHeaders, 'Location'));
+  if (details.statusCode === 302 && namedSource?.name && redirectTarget?.address && contents?.id) {
+    provenanceByWebContentsId.set(contents.id, {
+      url: documentUrl(redirectTarget.url),
+      pendingNameUrl: namedSource.displayUrl,
+      provenance: null,
+    });
+    return null;
+  }
   const gateUrl = decodeGateUrl(responseHeader(details.responseHeaders, GATE_HEADER), details.url);
   if (gateUrl && details.statusCode === 451) {
     const contents = details.webContents;
@@ -556,20 +707,17 @@ function captureOnchainProvenance(details) {
   if (details.statusCode !== 200) return null;
   const encoded = responseHeader(details.responseHeaders, PROVENANCE_HEADER);
   const provenance = decodeOnchainProvenance(encoded);
-  const contents = details.webContents;
   if (!provenance || !contents?.id) return null;
+
+  delete provenance.nameUrl;
+  if (previous?.pendingNameUrl && previous.url === documentUrl(details.url)) {
+    provenance.nameUrl = previous.pendingNameUrl;
+  }
 
   provenanceByWebContentsId.set(contents.id, {
     url: documentUrl(details.url),
     provenance,
   });
-  if (!observedWebContentsIds.has(contents.id)) {
-    observedWebContentsIds.add(contents.id);
-    contents.once?.('destroyed', () => {
-      provenanceByWebContentsId.delete(contents.id);
-      observedWebContentsIds.delete(contents.id);
-    });
-  }
   return null;
 }
 
@@ -661,6 +809,7 @@ module.exports = {
   handleOnchainAppRequest,
   installOnchainProvenanceCapture,
   parseOnchainAppUrl,
+  probeOnchainHtml,
   createOnchainAppTrustState,
   registerOnchainProvenanceIpc,
   registerOnchainAppProtocol,
