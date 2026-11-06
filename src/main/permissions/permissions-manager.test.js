@@ -1676,6 +1676,84 @@ describe('permissions-manager private windows', () => {
 // `openExternal` request carrying `externalURL`. It used to be denied with no
 // prompt; it now goes through the same per-site prompt, keyed per scheme, and
 // an allow hands the URL to shell.openExternal — never to Electron's callback.
+describe('permissions-manager: onchain network access', () => {
+  const APP = 'web3://0x00000095643cffa7d9fae407a84dfcb6406456c6';
+  const URL = `${APP}.eip155-1/`;
+  const HASH = `0x${'AB'.repeat(32)}`;
+  const KEY = `network:${HASH.toLowerCase()}`;
+  let userDataDir;
+  let ctx;
+
+  beforeEach(() => {
+    userDataDir = createTempUserDataDir();
+    nextHostId = 1;
+    allHosts.length = 0;
+    nextGuestId = 100;
+    ctx = loadMainModule(require.resolve('./permissions-manager'), { userDataDir });
+    ctx.mod.registerPermissionsIpc();
+  });
+
+  afterEach(() => removeTempUserDataDir(userDataDir));
+
+  const prompts = (host) =>
+    host.send.mock.calls.filter(([ch]) => ch === IPC.PERMISSIONS_PROMPT_REQUEST).map(([, p]) => p);
+
+  const ask = (guest, onDecision = jest.fn()) => {
+    ctx.mod.requestOnchainNetwork({ webContents: guest, htmlHash: HASH, onDecision });
+    return onDecision;
+  };
+
+  test('prompts under the contract and the document hash', () => {
+    const host = makeHost();
+    ask(makeGuest(URL, host));
+    expect(prompts(host)).toEqual([
+      expect.objectContaining({ origin: APP, keys: [KEY], permission: 'onchainNetwork' }),
+    ]);
+  });
+
+  test('an allow reaches the caller and applies to that document only', async () => {
+    const host = makeHost();
+    const onDecision = ask(makeGuest(URL, host));
+    await respondVia(ctx, { id: prompts(host)[0].id, decision: 'allow', remember: true }, host);
+    expect(onDecision).toHaveBeenCalledWith(true);
+    expect(ctx.mod.getEffectiveDecision(APP, KEY)).toBe('allow');
+    expect(ctx.mod.getEffectiveDecision(APP, ctx.mod.onchainNetworkKey(`0x${'cd'.repeat(32)}`))).toBeNull();
+  });
+
+  test('a remembered block refuses without prompting', async () => {
+    const host = makeHost();
+    await respondVia(
+      ctx,
+      { id: (ask(makeGuest(URL, host)), prompts(host)[0].id), decision: 'deny', remember: true },
+      host
+    );
+    const onDecision = ask(makeGuest(URL, host));
+    expect(onDecision).toHaveBeenCalledWith(false);
+    expect(prompts(host)).toHaveLength(1);
+  });
+
+  test('refuses a page that is not an onchain app', () => {
+    const host = makeHost();
+    const onDecision = jest.fn();
+    expect(ctx.mod.requestOnchainNetwork({
+      webContents: makeGuest('https://example.com/', host),
+      htmlHash: HASH,
+      onDecision,
+    })).toBe(false);
+    expect(prompts(host)).toHaveLength(0);
+  });
+
+  test('tells a listener when decisions change', () => {
+    const listener = jest.fn();
+    ctx.mod.setDecisionsChangedListener(listener);
+    ctx.mod.allowSitePermission(APP, KEY);
+    expect(listener).toHaveBeenCalled();
+    ctx.mod.revokeDecision(APP, KEY);
+    expect(listener).toHaveBeenCalledTimes(2);
+    expect(ctx.mod.getEffectiveDecision(APP, KEY)).toBeNull();
+  });
+});
+
 describe('permissions-manager: external protocols (#406)', () => {
   const PARTITION = 'private-ext-1';
   let userDataDir;

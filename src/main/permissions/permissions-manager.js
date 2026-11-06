@@ -32,6 +32,11 @@
  * the user chose in the native file/folder picker is tracked in
  * src/main/permissions/file-system-access.js and answered from there.
  *
+ * `network:<htmlHash>` lets one version of an onchain app reach the network
+ * (src/main/onchain/onchain-app-protocol.js). It is a per-origin decision like
+ * any other, except that the document's hash is part of the key, so a contract
+ * that serves different HTML asks again. Private windows never ask.
+ *
  * `pointerLock` and `fullscreen` stay auto-allowed (status quo). `hid`
  * is deliberately NOT promptable: Ledger hardware-wallet support drives
  * HID through its own connect flow, so web-page HID requests keep the
@@ -506,8 +511,19 @@ function originForLog(origin, privatePartition) {
   return privatePartition ? '<private>' : origin;
 }
 
+let decisionsChangedListener = null;
+
+function setDecisionsChangedListener(listener) {
+  decisionsChangedListener = listener;
+}
+
 function broadcastChanged() {
   broadcastToAllWebContents(IPC.PERMISSIONS_CHANGED, {});
+  try {
+    decisionsChangedListener?.();
+  } catch (err) {
+    log.warn(`[permissions] change listener failed: ${err.message}`);
+  }
 }
 
 // The key File System Access grants (#671) are listed and removed under. It
@@ -1076,6 +1092,33 @@ function requestOpenExternal({
   return true;
 }
 
+function onchainNetworkKey(htmlHash) {
+  return `network:${String(htmlHash).toLowerCase()}`;
+}
+
+/**
+ * An onchain app's document tried to reach the network. `onDecision(true)`
+ * means this exact document may have it the next time it is served.
+ *
+ * @param {Object} request
+ * @param {Electron.WebContents} request.webContents - the requesting guest
+ * @param {string} request.htmlHash - keccak256 of the served document
+ * @param {(allowed: boolean) => void} request.onDecision
+ * @returns {boolean} true when the request reached the decision step
+ */
+function requestOnchainNetwork({ webContents, htmlHash, onDecision }) {
+  const origin = originForRequest(webContents, {});
+  if (!origin?.startsWith('web3://')) return false;
+  decideOrPrompt({
+    webContents,
+    permission: 'onchainNetwork',
+    keys: [onchainNetworkKey(htmlHash)],
+    origin,
+    callback: onDecision,
+  });
+  return true;
+}
+
 /**
  * Install the request + check handlers on a session (the default
  * session — webviews carry no `partition` attribute, so they share it —
@@ -1476,6 +1519,9 @@ module.exports = {
   registerPermissionsIpc,
   permissionKeysForRequest,
   requestOpenExternal,
+  requestOnchainNetwork,
+  onchainNetworkKey,
+  setDecisionsChangedListener,
   getEffectiveDecision,
   siteOriginForWebContents,
   allowSitePermission,
