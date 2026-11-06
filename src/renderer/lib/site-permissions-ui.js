@@ -38,6 +38,7 @@ import { getPermissionKey } from './origin-utils.js';
 import { isModalDialogOpen } from './modal-dialog.js';
 import { pushDebug } from './debug.js';
 import { boundPopoverToViewport } from './popover-bounds.js';
+import { parseOnchainAppUrl } from './url-utils.js';
 
 // Storage-key → human noun (indicator popover, settings mirror this).
 const PERMISSION_LABELS = {
@@ -180,6 +181,28 @@ const takeNextPrompt = () => {
   return pendingPrompts.splice(index, 1)[0];
 };
 
+// Grants belong to the contract, so an app opened by name is keyed on the
+// page it actually runs in rather than on the name in the address bar.
+const sitePermissionKey = (webview) => {
+  try {
+    const pageUrl = webview?.getURL?.() || '';
+    if (/^web3:/i.test(pageUrl)) return getPermissionKey(pageUrl);
+  } catch {
+    // Not attached yet: no page to key on, so fall back to the committed URL.
+  }
+  const displayUrl = webview ? getDisplayUrlForWebview(webview) : '';
+  return displayUrl ? getPermissionKey(displayUrl) : null;
+};
+
+// The prompt names an onchain app the way the address bar does. Prompts only
+// show for the active tab, so its name is the requester's.
+const promptOriginLabel = (origin) => {
+  if (!origin?.startsWith('web3://')) return origin;
+  const webview = getActiveWebview();
+  const name = parseOnchainAppUrl(webview ? getDisplayUrlForWebview(webview) : '')?.name;
+  return name ? `web3://${name}` : origin;
+};
+
 const showNextPrompt = () => {
   if (activePrompt || !promptEl) return;
   const next = takeNextPrompt();
@@ -204,7 +227,9 @@ const showNextPrompt = () => {
     promptBlockBtn?.classList.add('hidden');
     if (promptAllowBtn) promptAllowBtn.textContent = 'OK';
   } else {
-    if (promptOriginEl) promptOriginEl.textContent = activePrompt.origin || 'This site';
+    if (promptOriginEl) {
+      promptOriginEl.textContent = promptOriginLabel(activePrompt.origin) || 'This site';
+    }
     if (promptActionEl) {
       promptActionEl.textContent = ` wants to ${describePermissionRequest(keys, activePrompt.appName)}`;
     }
@@ -349,9 +374,7 @@ const renderPopover = () => {
 const refreshIndicator = async () => {
   if (!indicatorBtn) return;
 
-  const webview = getActiveWebview();
-  const displayUrl = webview ? getDisplayUrlForWebview(webview) : '';
-  const origin = displayUrl ? getPermissionKey(displayUrl) : null;
+  const origin = sitePermissionKey(getActiveWebview());
 
   if (!origin || !sitePermissions()?.getForOrigin) {
     indicatorOrigin = null;
