@@ -92,6 +92,13 @@ describe('site-permissions-ui helpers', () => {
       expect(permissionRequestNote(['geolocation'])).toMatch(/may not work reliably/);
     });
 
+    test('onchain network access says what the app could send', () => {
+      const key = `network:0x${'ab'.repeat(32)}`;
+      expect(permissionRequestNote([key])).toMatch(/IP address and connected account/);
+      expect(permissionLabel(key)).toBe('Network access for this version');
+      expect(describePermissionRequest([key])).toBe('connect to the internet');
+    });
+
     test('other permissions carry no note', () => {
       expect(permissionRequestNote(['camera'])).toBeNull();
       expect(permissionRequestNote([])).toBeNull();

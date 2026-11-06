@@ -808,6 +808,15 @@ describe('navigation-utils', () => {
 });
 
 describe('named web3 display and provenance', () => {
+  test('lists network access only for a document that has it', async () => {
+    const { buildTrustRows } = await loadNavigationUtils();
+    const provenance = { chainId: 1, contract: '0x1', htmlHash: '0x2', trust: { level: 'verified' } };
+    const labels = (onchainProvenance) =>
+      buildTrustRows({ level: 'verified', onchainProvenance }).contentRows.map((row) => row.label);
+    expect(labels(provenance)).not.toContain('Network access');
+    expect(labels({ ...provenance, networkAccess: true })).toContain('Network access');
+  });
+
   test('uses existing ENS metadata and display helpers for web3', async () => {
     const { extractEnsResolutionMetadata, deriveDisplayAddress, deriveSwitchedTabDisplay } = await loadNavigationUtils();
     const address = '0x0000000d42137547140b0812e1178f025e08bc49';

@@ -203,6 +203,9 @@ const buildOnchainContentRows = (provenance) => [
     copy: provenance.htmlHash,
     autoFit: provenance.htmlHash,
   },
+  ...(provenance.networkAccess
+    ? [{ label: 'Network access', display: 'Allowed for this version', copy: '' }]
+    : []),
 ];
 
 // Pure helper that turns a `(trust, level, uri, proto)` tuple into the

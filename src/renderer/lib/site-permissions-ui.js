@@ -2,8 +2,9 @@
  * Site Permissions UI
  *
  * Two chrome surfaces for per-site web permissions (camera, mic,
- * notifications, clipboard-read, geolocation, MIDI, and opening an
- * external-protocol link — `external:<scheme>`, one key per scheme, #406):
+ * notifications, clipboard-read, geolocation, MIDI, opening an
+ * external-protocol link — `external:<scheme>`, one key per scheme, #406 —
+ * and network access for one version of an onchain app, `network:<hash>`):
  *
  * 1. The permission prompt anchored under the address bar. Main queues
  *    requests per requesting webContents (tab) and sends one per tab at
@@ -75,15 +76,20 @@ const externalScheme = (key) =>
     ? key.slice(EXTERNAL_KEY_PREFIX.length)
     : null;
 
+// One decision per onchain document: `network:<document hash>`.
+const isOnchainNetworkKey = (key) => typeof key === 'string' && key.startsWith('network:');
+
 export const permissionLabel = (key) => {
   const scheme = externalScheme(key);
   if (scheme) return `Open ${scheme}: links`;
+  if (isOnchainNetworkKey(key)) return 'Network access for this version';
   return PERMISSION_LABELS[key] || key;
 };
 
 const permissionPhrase = (key, appName) => {
   const scheme = externalScheme(key);
   if (scheme) return `open ${scheme}: links in ${appName || 'another app'}`;
+  if (isOnchainNetworkKey(key)) return 'connect to the internet';
   return PERMISSION_PHRASES[key] || `use ${key}`;
 };
 
@@ -119,6 +125,9 @@ export const permissionRequestNote = (keys = []) => {
   if (keys.includes('geolocation')) {
     return 'Location may not work reliably in Freedom.';
   }
+  if (keys.some(isOnchainNetworkKey)) {
+    return 'Onchain apps have no network access by default. If you allow it, this version can send what it knows, such as your IP address and connected account, to any server.';
+  }
   return null;
 };
 
@@ -129,6 +138,7 @@ let promptActionEl;
 let promptNoteEl;
 let promptRememberLabel;
 let promptRememberCheckbox;
+let promptRememberTextEl;
 let promptAllowBtn;
 let promptBlockBtn;
 let indicatorBtn;
@@ -239,6 +249,11 @@ const showNextPrompt = () => {
       promptNoteEl.classList.toggle('hidden', !note);
     }
     promptRememberLabel?.classList.remove('hidden');
+    if (promptRememberTextEl) {
+      promptRememberTextEl.textContent = keys.some(isOnchainNetworkKey)
+        ? 'Remember for this version'
+        : 'Remember for this site';
+    }
     if (promptRememberCheckbox) promptRememberCheckbox.checked = true;
     promptBlockBtn?.classList.remove('hidden');
     if (promptAllowBtn) promptAllowBtn.textContent = 'Allow';
@@ -419,6 +434,7 @@ export const initSitePermissionsUi = () => {
   promptActionEl = document.getElementById('permission-prompt-action');
   promptNoteEl = document.getElementById('permission-prompt-note');
   promptRememberLabel = document.getElementById('permission-prompt-remember-label');
+  promptRememberTextEl = document.getElementById('permission-prompt-remember-text');
   promptRememberCheckbox = document.getElementById('permission-prompt-remember');
   promptAllowBtn = document.getElementById('permission-prompt-allow');
   promptBlockBtn = document.getElementById('permission-prompt-block');

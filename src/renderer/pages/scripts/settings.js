@@ -4371,7 +4371,9 @@ freedomAPI.onSettingsUpdated?.((settings) => {
   const label = (key) =>
     key.startsWith('external:')
       ? `Open ${key.slice('external:'.length)}: links`
-      : PERMISSION_LABELS[key] || key;
+      : key.startsWith('network:')
+        ? 'Network access for this version'
+        : PERMISSION_LABELS[key] || key;
 
   // File System Access grants (#671) are listed for the run only: main
   // drops them at quit and never stores them.
