@@ -176,3 +176,15 @@ describe('renderer origin-utils vs shared origin-utils', () => {
     });
   });
 });
+
+
+test.each([
+  'web3://app.eth/html', 'web3://app.wei:11155111/html',
+  'w3://app.gwei.eip155-8453/html',
+  'web3://0x2222222222222222222222222222222222222222@app.eth:1/html',
+])('web3 name permission keys agree across processes: %s', (url) => {
+  const shared = require('../../shared/origin-utils');
+  const renderer = require('./origin-utils');
+  expect(renderer.getPermissionKey(url)).toBe(shared.getPermissionKey(url));
+  expect(renderer.parseWeb3Url(url)).toEqual(shared.parseWeb3Url(url));
+});

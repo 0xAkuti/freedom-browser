@@ -140,3 +140,23 @@ describe('origin-utils', () => {
     });
   });
 });
+
+
+describe('web3 names and sender-scoped reads', () => {
+  const { parseWeb3Url } = require('./origin-utils');
+  test.each(['app.eth', 'app.box', 'app.wei', 'app.gwei'])('keys %s by name and chain without paths', (name) => {
+    expect(getPermissionKey(`web3://${name}.eip155-8453/html`)).toBe(`web3://${name}:8453`);
+    expect(getPermissionKey(`web3://${name}/html`)).toBe(`web3://${name}`);
+  });
+  test('does not fork wallet grants by read-only sender', () => {
+    expect(getPermissionKey('web3://0x2222222222222222222222222222222222222222@app.eth:1/html')).toBe('web3://app.eth');
+  });
+  test.each([
+    'web3://app.eth:0/', 'web3://app.eth:01/', 'web3://app.eth:9007199254740992/',
+    'web3://app.eth.eip155-0/', 'web3://app.eth.eip155-1:8453/',
+    'web3://user@app.eth/', 'web3://app.eth/\\path', 'web3://app.%2feth/',
+    'web3://app.eth/html extra', 'web3://app.eth/a\tb',
+  ])('rejects invalid web3 URL %s', (input) => {
+    expect(parseWeb3Url(input)).toBeNull();
+  });
+});

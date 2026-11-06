@@ -65,6 +65,56 @@ function isDwebNameHost(host) {
   return isEnsHost(host) || isTezosDomainHost(host);
 }
 
+// URL codec shared with the renderer mirror. Chain IDs belong in the
+// hostname internally: Chromium treats :chain as a port and rejects bare
+// hexadecimal contract hosts as oversized IPv4 literals.
+function parseWeb3Url(input) {
+  const raw = typeof input === 'string' ? input.trim() : '';
+  if (/[\s\\]/u.test(raw) || Array.from(raw).some((c) => c.codePointAt(0) < 32 || c.codePointAt(0) === 127)) return null;
+  const match = raw.match(/^(?:web3|w3):\/\/(?:([0-9a-z]+)@)?([^/?#:]+)(?::([1-9][0-9]*))?([^#]*)(#.*)?$/i);
+  if (!match) return null;
+  const from = match[1]?.toLowerCase();
+  if (from && !/^0x[0-9a-f]{40}$/.test(from)) return null;
+  const internal = match[2].match(/^(.+)\.eip155-([1-9][0-9]*)$/i);
+  if (internal && match[3]) return null;
+  if (!internal && /\.eip155-[^.]*$/i.test(match[2])) return null;
+  const chainId = Number(internal?.[2] || match[3] || 1);
+  if (!Number.isSafeInteger(chainId) || chainId <= 0) return null;
+  let target;
+  try {
+    target = decodeURIComponent(internal?.[1] || match[2]).toLowerCase();
+  } catch {
+    return null;
+  }
+  const address = /^0x[0-9a-f]{40}$/.test(target) ? target : null;
+  if (!address && !isPotentialEnsName(target)) return null;
+  // A malformed address must not fall through to name resolution.
+  if (!address && /^0x[0-9a-f]+$/i.test(target)) return null;
+  const suffix = match[4] || '/';
+  if (!suffix.startsWith('/') && !suffix.startsWith('?')) return null;
+  const pathQuery = suffix.startsWith('/') ? suffix : `/${suffix}`;
+  const sender = from ? `${from}@` : '';
+  let url;
+  try {
+    url = new URL(`web3://${sender}${target}.eip155-${chainId}${pathQuery}${match[5] || ''}`);
+  } catch {
+    return null;
+  }
+  if (url.username !== (from || '') || url.password || url.port) return null;
+  const name = address ? null : url.hostname.replace(/\.eip155-[0-9]+$/, '');
+  return {
+    address,
+    name,
+    chainId,
+    from,
+    path: url.pathname,
+    query: url.search,
+    fragment: url.hash,
+    url: url.toString(),
+    displayUrl: `web3://${sender}${name || address}${chainId === 1 ? '' : `:${chainId}`}${url.pathname}${url.search}${url.hash}`,
+  };
+}
+
 /**
  * Extract the permission key from a display URL.
  * Returns the root content identity, never including paths.
@@ -115,15 +165,10 @@ function getPermissionKey(displayUrl) {
   // ERC-8244 application origin. Chain identity is part of the permission
   // boundary: the same 20-byte contract address on another chain is a
   // different app and must never inherit wallet grants.
-  const onchainMatch =
-    trimmed.match(/^web3:\/\/(0x[0-9a-f]{40})\.eip155-([0-9]+)(?:[/?#]|$)/i) ||
-    trimmed.match(/^web3:\/\/(0x[0-9a-f]{40})(?::([0-9]+))?(?:[/?#]|$)/i);
-  if (onchainMatch) {
-    const chainId = onchainMatch[2] ? Number(onchainMatch[2]) : 1;
-    if (Number.isSafeInteger(chainId) && chainId > 0) {
-      const chainSuffix = chainId === 1 ? '' : `:${chainId}`;
-      return `web3://${onchainMatch[1].toLowerCase()}${chainSuffix}`;
-    }
+  const onchain = parseWeb3Url(trimmed);
+  if (onchain) {
+    const chainSuffix = onchain.chainId === 1 ? '' : `:${onchain.chainId}`;
+    return `web3://${onchain.address || onchain.name}${chainSuffix}`;
   }
 
   // Regular URL (https://host/path → https://host)
@@ -149,4 +194,4 @@ function normalizeOrigin(origin) {
   return getPermissionKey(origin) || '';
 }
 
-module.exports = { isPotentialEnsName, getPermissionKey, isDwebNameHost, isEnsHost, isTezosDomainHost, normalizeOrigin };
+module.exports = { isPotentialEnsName, getPermissionKey, isDwebNameHost, isEnsHost, isTezosDomainHost, normalizeOrigin, parseWeb3Url };
