@@ -77,6 +77,9 @@ const PUBLIC_CHANNELS = [
   // A digit-row keydown the page did not cancel (tab-switch-keys.js). At
   // most it zooms the sender's own window's active tab.
   'page:unhandled-key',
+  // An onchain app hit its no-network policy. At most it raises one site
+  // permission prompt for the sender's own top-level document.
+  'onchain-app:network-blocked',
 ];
 
 // freedomAPI methods wrapped in guardInternal (plus the internal-page theme

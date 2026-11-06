@@ -591,6 +591,22 @@ if (globalThis.window && globalThis.window.top !== globalThis.window) {
   return;
 }
 
+// An onchain app starts with no network access. Its first blocked connection
+// is what asks the user, so an app that never needs the network never prompts.
+// Main decides from its own record of this document; this only reports the
+// block, and a page cannot synthesize a trusted event.
+if (globalThis.location?.protocol === 'web3:') {
+  const reportBlockedConnection = (event) => {
+    if (!event.isTrusted || event.disposition !== 'enforce') return;
+    if (event.effectiveDirective !== 'connect-src' && event.effectiveDirective !== 'worker-src') {
+      return;
+    }
+    document.removeEventListener('securitypolicyviolation', reportBlockedConnection, true);
+    ipcRenderer.send('onchain-app:network-blocked');
+  };
+  document.addEventListener('securitypolicyviolation', reportBlockedConnection, true);
+}
+
 // Per-load constants, delivered with the renderer process (#512): the main
 // process puts them on this webview's command line when it attaches
 // (src/main/webview-boot.js, webcontents-setup.js), so reading them here costs

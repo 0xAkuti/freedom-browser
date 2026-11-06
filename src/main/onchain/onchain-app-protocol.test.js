@@ -1,5 +1,5 @@
 jest.mock('electron', () => ({
-  ipcMain: { handle: jest.fn() },
+  ipcMain: { handle: jest.fn(), on: jest.fn() },
   webContents: { fromId: jest.fn() },
 }));
 
@@ -11,6 +11,17 @@ jest.mock('../logger', () => ({
 
 jest.mock('../networks/chain-data-router', () => ({
   request: jest.fn(),
+}));
+
+jest.mock('../permissions/permissions-manager', () => ({
+  getEffectiveDecision: jest.fn(() => null),
+  onchainNetworkKey: (hash) => `network:${hash}`,
+  requestOnchainNetwork: jest.fn(() => true),
+  setDecisionsChangedListener: jest.fn(),
+}));
+
+jest.mock('../private/private-windows', () => ({
+  getPartitionForWebContents: jest.fn(() => null),
 }));
 
 jest.mock('../networks/network-registry', () => ({
@@ -26,8 +37,10 @@ const {
   HTML_SELECTOR,
   MAX_HTML_BYTES,
   ONCHAIN_APP_CSP,
+  ONCHAIN_APP_NETWORK_CSP,
   PROVENANCE_HEADER,
   decodeOnchainProvenance,
+  encodeOnchainProvenance,
   createOnchainAppTrustState,
   captureOnchainProvenance,
   guardOnchainAppRequest,
@@ -37,6 +50,8 @@ const {
   probeOnchainHtml,
   registerOnchainAppProtocol,
   registerOnchainProvenanceIpc,
+  reloadRevokedDocuments,
+  requestNetworkAccess,
 } = require('./onchain-app-protocol');
 const { TaskWorkerTimeout } = require('../task-worker-host');
 
@@ -506,6 +521,28 @@ describe('guardOnchainAppRequest', () => {
 describe('registerOnchainAppProtocol private sessions', () => {
   beforeEach(() => jest.clearAllMocks());
 
+  test.each([
+    ['honors a stored network grant in a normal session', {}, ONCHAIN_APP_NETWORK_CSP],
+    ['never relaxes a private session', { privatePartition: 'private-test' }, ONCHAIN_APP_CSP],
+  ])('%s', async (_label, options, policy) => {
+    const permissions = require('../permissions/permissions-manager');
+    const handlers = new Map();
+    const targetSession = {
+      protocol: { handle: (scheme, handler) => handlers.set(scheme, handler) },
+    };
+    chainData.request.mockResolvedValue({
+      result: encodedHtml('<h1>app</h1>'),
+      trust: { level: 'verified' },
+    });
+    permissions.getEffectiveDecision.mockReturnValueOnce('allow');
+
+    registerOnchainAppProtocol(targetSession, options);
+    const response = await handlers.get('web3')(request(appUrl()));
+
+    expect(response.headers.get('content-security-policy')).toBe(policy);
+    permissions.getEffectiveDecision.mockReset();
+  });
+
   test('registers web3 and redacts a private contract URL from logs', async () => {
     const handlers = new Map();
     const targetSession = {
@@ -835,6 +872,182 @@ describe('web3 name and contract calls', () => {
   });
 });
 
+
+describe('network access for one document', () => {
+  const abi = ethers.AbiCoder.defaultAbiCoder();
+  const verified = { level: 'verified' };
+  const page = '<h1>app</h1>';
+  const chainRequest = jest.fn().mockResolvedValue({
+    result: abi.encode(['string'], [page]),
+    trust: verified,
+  });
+  const provenanceOf = (response) =>
+    decodeOnchainProvenance(response.headers.get(PROVENANCE_HEADER));
+
+  test('keeps the no-network policy without a grant', async () => {
+    const response = await handleOnchainAppRequest(request(appUrl()), { chainRequest });
+    expect(response.headers.get('content-security-policy')).toBe(ONCHAIN_APP_CSP);
+    expect(provenanceOf(response).networkAccess).toBeUndefined();
+  });
+
+  test('relaxes only the connection, worker and WebAssembly directives for a granted document', async () => {
+    const hasNetworkAccess = jest.fn().mockReturnValue(true);
+    const response = await handleOnchainAppRequest(request(appUrl()), { chainRequest, hasNetworkAccess });
+    const policy = response.headers.get('content-security-policy');
+    expect(policy).toBe(ONCHAIN_APP_NETWORK_CSP);
+    expect(policy).toContain('connect-src https: wss:');
+    expect(policy).toContain('worker-src blob:');
+    expect(policy).toContain("'wasm-unsafe-eval'");
+    expect(policy).not.toMatch(/connect-src[^;]*\bhttp:/);
+    for (const directive of ["frame-src 'none'", "object-src 'none'", "base-uri 'none'", "form-action 'none'", "frame-ancestors 'none'"]) {
+      expect(policy).toContain(directive);
+    }
+    expect(policy.match(/sandbox [^;]*/)[0]).toBe(ONCHAIN_APP_CSP.match(/sandbox [^;]*/)[0]);
+    expect(provenanceOf(response).networkAccess).toBe(true);
+    expect(hasNetworkAccess).toHaveBeenCalledWith(
+      expect.objectContaining({ address: CANONICAL_ADDRESS, chainId: 1 }),
+      ethers.keccak256(ethers.toUtf8Bytes(page))
+    );
+  });
+
+  test('applies the grant to a document released through the trust gate', async () => {
+    const trustState = createOnchainAppTrustState({ createToken: () => 'a'.repeat(43) });
+    const unverified = jest.fn().mockResolvedValue({
+      result: abi.encode(['string'], [page]),
+      trust: { level: 'unverified', method: 'direct' },
+    });
+    await handleOnchainAppRequest(request(appUrl()), { chainRequest: unverified, trustState });
+    const approved = request(appUrl());
+    approved.headers.set(APPROVAL_HEADER, 'a'.repeat(43));
+    const response = await handleOnchainAppRequest(approved, {
+      chainRequest: unverified,
+      trustState,
+      hasNetworkAccess: () => true,
+    });
+    expect(response.headers.get('content-security-policy')).toBe(ONCHAIN_APP_NETWORK_CSP);
+  });
+
+  describe('asking for it', () => {
+    const permissions = require('../permissions/permissions-manager');
+    const { getPartitionForWebContents } = require('../private/private-windows');
+    const url = 'web3://0x00000095643cffa7d9fae407a84dfcb6406456c6.eip155-1/';
+    const hash = `0x${'ab'.repeat(32)}`;
+    const { requestOnchainNetwork } = permissions;
+    let nextId = 900;
+
+    const servedGuest = (provenance = {}) => {
+      const mainFrame = {};
+      const contents = {
+        id: nextId++,
+        mainFrame,
+        getURL: () => `${url}#/deep`,
+        reload: jest.fn(),
+        once: jest.fn(),
+        isDestroyed: () => false,
+      };
+      captureOnchainProvenance({
+        resourceType: 'mainFrame',
+        statusCode: 200,
+        url,
+        webContents: contents,
+        responseHeaders: {
+          [PROVENANCE_HEADER]: [encodeOnchainProvenance({
+            version: 1,
+            chainId: 1,
+            contract: '0x00000095643CFfA7D9fae407a84dfCB6406456c6',
+            htmlHash: hash,
+            trust: { level: 'verified' },
+            ...provenance,
+          })],
+        },
+      });
+      return contents;
+    };
+
+    beforeEach(() => {
+      getPartitionForWebContents.mockReturnValue(null);
+      requestOnchainNetwork.mockClear();
+    });
+
+    test('prompts once per document with the hash main recorded', () => {
+      const guest = servedGuest();
+      expect(requestNetworkAccess(guest, guest.mainFrame)).toBe(true);
+      expect(requestOnchainNetwork).toHaveBeenCalledWith(
+        expect.objectContaining({ webContents: guest, htmlHash: hash })
+      );
+      expect(requestNetworkAccess(guest, guest.mainFrame)).toBe(false);
+      expect(requestOnchainNetwork).toHaveBeenCalledTimes(1);
+    });
+
+    test('reloads the document after an allow, and not after a refusal', () => {
+      const guest = servedGuest();
+      requestNetworkAccess(guest, guest.mainFrame);
+      const { onDecision } = requestOnchainNetwork.mock.calls[0][0];
+      onDecision(false);
+      expect(guest.reload).not.toHaveBeenCalled();
+      onDecision(true);
+      expect(guest.reload).toHaveBeenCalledTimes(1);
+    });
+
+    test('reloads once if the document comes back without the grant', () => {
+      const guest = servedGuest();
+      requestNetworkAccess(guest, guest.mainFrame);
+      requestOnchainNetwork.mock.calls[0][0].onDecision(true);
+      captureOnchainProvenance({
+        resourceType: 'mainFrame',
+        statusCode: 200,
+        url,
+        webContents: guest,
+        responseHeaders: {
+          [PROVENANCE_HEADER]: [encodeOnchainProvenance({
+            version: 1, chainId: 1, contract: ADDRESS, htmlHash: hash, trust: { level: 'verified' },
+          })],
+        },
+      });
+      requestNetworkAccess(guest, guest.mainFrame);
+      requestOnchainNetwork.mock.calls[1][0].onDecision(true);
+      expect(guest.reload).toHaveBeenCalledTimes(1);
+    });
+
+    test('does not reload a tab that has moved on to another document', () => {
+      const guest = servedGuest();
+      requestNetworkAccess(guest, guest.mainFrame);
+      const { onDecision } = requestOnchainNetwork.mock.calls[0][0];
+      captureOnchainProvenance({ resourceType: 'mainFrame', statusCode: 200, url: 'https://example.com/', webContents: guest });
+      onDecision(true);
+      expect(guest.reload).not.toHaveBeenCalled();
+    });
+
+    test('ignores a sub-frame, a document already granted and a private window', () => {
+      const guest = servedGuest();
+      expect(requestNetworkAccess(guest, {})).toBe(false);
+      const granted = servedGuest({ networkAccess: true });
+      expect(requestNetworkAccess(granted, granted.mainFrame)).toBe(false);
+      getPartitionForWebContents.mockReturnValue('private-1');
+      const privateGuest = servedGuest();
+      expect(requestNetworkAccess(privateGuest, privateGuest.mainFrame)).toBe(false);
+      expect(requestOnchainNetwork).not.toHaveBeenCalled();
+    });
+
+    test('ignores a guest with no onchain document on record', () => {
+      const guest = { id: nextId++, mainFrame: {}, getURL: () => url };
+      expect(requestNetworkAccess(guest, guest.mainFrame)).toBe(false);
+    });
+
+    test('reloads only documents whose grant was revoked', () => {
+      const kept = servedGuest({ networkAccess: true, htmlHash: `0x${'cd'.repeat(32)}` });
+      const revoked = servedGuest({ networkAccess: true });
+      const strict = servedGuest();
+      const guests = new Map([kept, revoked, strict].map((guest) => [guest.id, guest]));
+      const hasAccess = (_app, htmlHash) => htmlHash !== hash;
+      reloadRevokedDocuments((id) => guests.get(id), hasAccess);
+      reloadRevokedDocuments((id) => guests.get(id), hasAccess);
+      expect(revoked.reload).toHaveBeenCalledTimes(1);
+      expect(kept.reload).not.toHaveBeenCalled();
+      expect(strict.reload).not.toHaveBeenCalled();
+    });
+  });
+});
 
 describe('ERC-8244 address-record discovery', () => {
   const trust = { level: 'verified', method: 'myotis' };

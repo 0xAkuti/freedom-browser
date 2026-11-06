@@ -69,6 +69,7 @@ module.exports = {
 
   // Contract-hosted application provenance (host chrome only)
   ONCHAIN_APP_GET_PROVENANCE: 'onchain-app:get-provenance',
+  ONCHAIN_APP_NETWORK_BLOCKED: 'onchain-app:network-blocked',
 
   // Tezos Domains website resolution
   TEZOS_DOMAINS_RESOLVE: 'tezos-domains:resolve',

@@ -6,6 +6,9 @@
  * resolve before executing code under a contract-and-chain-scoped origin.
  * Network access from the document is denied by response policy; Ethereum
  * reads and signing continue through Freedom's existing EIP-1193 bridge.
+ * A user can allow one document to reach the network: the grant is a site
+ * permission keyed by contract, chain and document hash, and is never offered
+ * in a private window.
  */
 
 const crypto = require('crypto');
@@ -55,6 +58,10 @@ const htmlWorker = createTaskWorkerHost({
 });
 const provenanceByWebContentsId = new Map();
 const observedWebContentsIds = new Set();
+// Document hash a guest last reloaded for after an allow. Should the reload
+// not come back with the grant applied, the app stays on the default policy
+// instead of reloading forever.
+const networkReloadByWebContentsId = new Map();
 const ONCHAIN_INTERSTITIAL_URL = pathToFileURL(
   path.join(__dirname, '../../renderer/pages/onchain-unverified.html')
 ).toString();
@@ -79,6 +86,14 @@ const ONCHAIN_APP_CSP = [
   // custom-scheme origin, inside a context-isolated webview.
   'sandbox allow-scripts allow-same-origin allow-forms allow-modals allow-downloads',
 ].join('; ');
+
+// What a document may do once the user has allowed it to reach the network.
+// Workers and WebAssembly are part of the grant: network clients for this kind
+// of app (light clients, mixnets) run in both. Everything else stays denied.
+const ONCHAIN_APP_NETWORK_CSP = ONCHAIN_APP_CSP
+  .replace("script-src 'unsafe-inline' blob:", "script-src 'unsafe-inline' 'wasm-unsafe-eval' blob:")
+  .replace("connect-src 'none'", 'connect-src https: wss:')
+  .replace("worker-src 'none'", 'worker-src blob:');
 
 const ONCHAIN_APP_PERMISSIONS_POLICY = [
   'accelerometer=()',
@@ -226,11 +241,32 @@ function decodeOnchainProvenance(value) {
   }
 }
 
-function htmlResponse(html, app, provenance, chainResult, method, contentType = 'text/html; charset=utf-8') {
+// Only an explicit, still-standing allow relaxes the policy; a failed lookup
+// keeps the document on the default.
+function hasNetworkGrant(app, htmlHash) {
+  try {
+    const permissions = require('../permissions/permissions-manager');
+    const origin = getPermissionKey(`web3://${app.address.toLowerCase()}:${app.chainId}/`);
+    return permissions.getEffectiveDecision(origin, permissions.onchainNetworkKey(htmlHash)) === 'allow';
+  } catch (error) {
+    log.warn(`[onchain-app] could not read a network grant: ${error?.message || error}`);
+    return false;
+  }
+}
+
+function htmlResponse(
+  html,
+  app,
+  provenance,
+  chainResult,
+  method,
+  contentType = 'text/html; charset=utf-8',
+  networkAccess = false
+) {
   const headers = {
     ...(contentType ? { 'Content-Type': contentType } : {}),
     'Cache-Control': 'no-store',
-    'Content-Security-Policy': ONCHAIN_APP_CSP,
+    'Content-Security-Policy': networkAccess ? ONCHAIN_APP_NETWORK_CSP : ONCHAIN_APP_CSP,
     'Permissions-Policy': ONCHAIN_APP_PERMISSIONS_POLICY,
     'Referrer-Policy': 'no-referrer',
     'X-Content-Type-Options': 'nosniff',
@@ -239,7 +275,9 @@ function htmlResponse(html, app, provenance, chainResult, method, contentType = 
     'X-Freedom-Onchain-App-Contract': app.address,
     'X-Freedom-Onchain-App-Source': chainResult.source || 'unknown',
     'X-Freedom-Onchain-App-Verified': chainResult.verified === true ? 'true' : 'false',
-    [PROVENANCE_HEADER]: encodeOnchainProvenance(provenance),
+    [PROVENANCE_HEADER]: encodeOnchainProvenance(
+      networkAccess ? { ...provenance, networkAccess: true } : provenance
+    ),
   };
   return new Response(method === 'HEAD' ? null : html, { status: 200, headers });
 }
@@ -433,6 +471,7 @@ async function handleOnchainAppRequest(
     timeoutMs = REQUEST_TIMEOUT_MS,
     trustState = standaloneTrustState,
     resolveName = resolveWeb3Name,
+    hasNetworkAccess = () => false,
   } = {}
 ) {
   const method = (request.method || 'GET').toUpperCase();
@@ -461,7 +500,8 @@ async function handleOnchainAppRequest(
         approvedCandidate.provenance,
         approvedCandidate.chainResult,
         method,
-        approvedCandidate.contentType
+        approvedCandidate.contentType,
+        hasNetworkAccess(approvedCandidate.app, approvedCandidate.provenance.htmlHash)
       );
     }
   }
@@ -587,7 +627,15 @@ async function handleOnchainAppRequest(
       );
     }
     if (redirectUrl) return redirectResponse(redirectUrl);
-    return htmlResponse(html, app, provenance, chainResult || {}, method, contentType);
+    return htmlResponse(
+      html,
+      app,
+      provenance,
+      chainResult || {},
+      method,
+      contentType,
+      hasNetworkAccess(app, provenance.htmlHash)
+    );
   } catch (error) {
     const loggedUrl = redactUrlForLog(request.url);
     if (error?.code === 'ONCHAIN_APP_TOO_LARGE') {
@@ -669,6 +717,7 @@ function captureOnchainProvenance(details) {
     contents.once?.('destroyed', () => {
       provenanceByWebContentsId.delete(contents.id);
       observedWebContentsIds.delete(contents.id);
+      networkReloadByWebContentsId.delete(contents.id);
     });
   }
   // Preserve only a redirect issued by our name resolver, for this guest and
@@ -713,6 +762,7 @@ function captureOnchainProvenance(details) {
   if (previous?.pendingNameUrl && previous.url === documentUrl(details.url)) {
     provenance.nameUrl = previous.pendingNameUrl;
   }
+  if (provenance.networkAccess) networkReloadByWebContentsId.delete(contents.id);
 
   provenanceByWebContentsId.set(contents.id, {
     url: documentUrl(details.url),
@@ -756,9 +806,55 @@ function installOnchainProvenanceCapture() {
   registerWebRequestHandler('onHeadersReceived', 'onchain-provenance', captureOnchainProvenance);
 }
 
+// Raise the network prompt for the guest's top-level document, once per
+// document. Everything here comes from main's own records, never from the
+// page: it only reports that it was blocked.
+function requestNetworkAccess(contents, frame) {
+  if (!contents?.id || contents.isDestroyed?.()) return false;
+  if (frame && frame !== contents.mainFrame) return false;
+  const record = provenanceByWebContentsId.get(contents.id);
+  if (!record?.provenance || record.provenance.networkAccess || record.networkRequested) return false;
+  if (getPermissionKey(contents.getURL()) !== getPermissionKey(record.url)) return false;
+  const { getPartitionForWebContents } = require('../private/private-windows');
+  if (getPartitionForWebContents(contents)) return false;
+
+  record.networkRequested = true;
+  const permissions = require('../permissions/permissions-manager');
+  return permissions.requestOnchainNetwork({
+    webContents: contents,
+    htmlHash: record.provenance.htmlHash,
+    onDecision: (allowed) => {
+      if (!allowed || contents.isDestroyed?.()) return;
+      if (provenanceByWebContentsId.get(contents.id) !== record) return;
+      if (networkReloadByWebContentsId.get(contents.id) === record.provenance.htmlHash) return;
+      networkReloadByWebContentsId.set(contents.id, record.provenance.htmlHash);
+      contents.reload();
+    },
+  });
+}
+
+// A running document keeps its response policy until it reloads, so a revoke
+// has to replace every document that was served under the grant.
+function reloadRevokedDocuments(fromId, hasAccess = hasNetworkGrant) {
+  for (const [id, record] of provenanceByWebContentsId) {
+    const provenance = record.provenance;
+    if (!provenance?.networkAccess) continue;
+    const app = { address: provenance.contract, chainId: provenance.chainId };
+    if (hasAccess(app, provenance.htmlHash)) continue;
+    provenance.networkAccess = false;
+    networkReloadByWebContentsId.delete(id);
+    fromId(id)?.reload();
+  }
+}
+
 function registerOnchainProvenanceIpc() {
   const { ipcMain, webContents } = require('electron');
   const IPC = require('../../shared/ipc-channels');
+  const permissions = require('../permissions/permissions-manager');
+  ipcMain.on(IPC.ONCHAIN_APP_NETWORK_BLOCKED, (event) => {
+    requestNetworkAccess(event.sender, event.senderFrame);
+  });
+  permissions.setDecisionsChangedListener(() => reloadRevokedDocuments(webContents.fromId));
   ipcMain.handle(IPC.ONCHAIN_APP_GET_PROVENANCE, (event, payload = {}) => {
     const webContentsId = Number(payload.webContentsId);
     if (!Number.isSafeInteger(webContentsId) || webContentsId <= 0) return null;
@@ -779,7 +875,12 @@ function registerOnchainAppProtocol(targetSession, { privatePartition = null } =
   const trustState = createOnchainAppTrustState();
   try {
     targetSession.protocol.handle('web3', (request) =>
-      runWithPrivateLogContext(isPrivate, () => handleOnchainAppRequest(request, { trustState }))
+      runWithPrivateLogContext(isPrivate, () =>
+        handleOnchainAppRequest(request, {
+          trustState,
+          hasNetworkAccess: isPrivate ? () => false : hasNetworkGrant,
+        })
+      )
     );
     log.info('[onchain-app] web3: handler registered');
   } catch (error) {
@@ -794,6 +895,7 @@ module.exports = {
   HTML_SELECTOR,
   MAX_HTML_BYTES,
   ONCHAIN_APP_CSP,
+  ONCHAIN_APP_NETWORK_CSP,
   ONCHAIN_APP_PERMISSIONS_POLICY,
   REQUEST_TIMEOUT_MS,
   PROVENANCE_HEADER,
@@ -810,6 +912,8 @@ module.exports = {
   installOnchainProvenanceCapture,
   parseOnchainAppUrl,
   probeOnchainHtml,
+  reloadRevokedDocuments,
+  requestNetworkAccess,
   createOnchainAppTrustState,
   registerOnchainProvenanceIpc,
   registerOnchainAppProtocol,
