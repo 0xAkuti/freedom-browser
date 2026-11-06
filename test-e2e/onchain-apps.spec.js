@@ -8,6 +8,7 @@ const { test, expect } = require('./fixtures');
 const { ethers } = require('ethers');
 const {
   GATE_HEADER,
+  ONCHAIN_APP_CSP,
   PROVENANCE_HEADER,
   buildOnchainInterstitialUrl,
   encodeOnchainProvenance,
@@ -261,6 +262,54 @@ test('opens a bare name whose address serves html() without website records', as
   await input.fill(`web3://${address}/`);
   await input.press('Enter');
   await expect(input).toHaveValue(`web3://${address}/`);
+});
+
+test('asks before an app reaches the network, and takes the grant back', async ({
+  window,
+  harness,
+}) => {
+  const address = '0x2222222222222222222222222222222222222222';
+  const url = `web3://${address}.eip155-1/`;
+  await harness.setContentFixture(url, {
+    body: `<!doctype html><title>Network fixture</title><h1 id="app">Network fixture</h1>
+      <script>fetch('https://example.invalid/').catch(() => {})</script>`,
+    headers: {
+      'Content-Security-Policy': ONCHAIN_APP_CSP,
+      [PROVENANCE_HEADER]: encodeOnchainProvenance({
+        version: 1,
+        chainId: 1,
+        network: 'Ethereum',
+        contract: address,
+        htmlHash: HTML_HASH,
+        trust: { level: 'verified', method: 'myotis', agreed: [], dissented: [], queried: [] },
+      }),
+    },
+  });
+
+  await expect
+    .poll(() =>
+      window.evaluate(() => document.querySelector('webview:not(.hidden)')?.getURL() || '')
+    )
+    .toContain('/pages/home.html');
+  const input = window.locator('[data-test="address-input"]');
+  await input.fill(`web3://${address}/`);
+  await input.press('Enter');
+
+  const prompt = window.locator('[data-test="permission-prompt"]');
+  await expect(prompt).toBeVisible();
+  await expect(prompt).toContainText('connect to the internet');
+  await expect(prompt).toContainText('Remember for this version');
+
+  await window.locator('[data-test="permission-allow"]').click();
+  await expect(prompt).toBeHidden();
+
+  const indicator = window.locator('[data-test="permission-indicator"]');
+  await expect(indicator).toBeVisible();
+  await indicator.click();
+  const popover = window.locator('#permission-popover');
+  await expect(popover).toContainText('Network access for this version');
+  await popover.locator('button').first().click();
+  await expect(indicator).toBeHidden();
 });
 
 test('shows the browser-owned gate before unverified onchain app code can run', async ({
